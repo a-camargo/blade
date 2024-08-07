@@ -173,6 +173,7 @@ fn map_render_target(rt: &crate::RenderTarget) -> vk::RenderingAttachmentInfo<'s
                         float32: [0.0, 0.0, 0.0, 1.0],
                     },
                     crate::TextureColor::White => vk::ClearColorValue { float32: [1.0; 4] },
+                    crate::TextureColor::Custom(values) => vk::ClearColorValue { float32: values }
                 },
             }
         } else {
@@ -186,6 +187,10 @@ fn map_render_target(rt: &crate::RenderTarget) -> vk::RenderingAttachmentInfo<'s
                     crate::TextureColor::White => vk::ClearDepthStencilValue {
                         depth: 1.0,
                         stencil: !0,
+                    },
+                    crate::TextureColor::Custom(_) => vk::ClearDepthStencilValue {
+                        depth: 1.0,
+                        stencil: 0,
                     },
                 },
             }

@@ -528,5 +528,6 @@ fn map_border_color(border_color: crate::TextureColor) -> vk::BorderColor {
         crate::TextureColor::TransparentBlack => vk::BorderColor::FLOAT_TRANSPARENT_BLACK,
         crate::TextureColor::OpaqueBlack => vk::BorderColor::FLOAT_OPAQUE_BLACK,
         crate::TextureColor::White => vk::BorderColor::FLOAT_OPAQUE_WHITE,
+        crate::TextureColor::Custom(_) => vk::BorderColor::FLOAT_CUSTOM_EXT
     }
 }

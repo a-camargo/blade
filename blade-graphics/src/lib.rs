@@ -477,6 +477,7 @@ pub enum TextureColor {
     TransparentBlack,
     OpaqueBlack,
     White,
+    Custom([f32;4])
 }
 
 #[derive(Debug, Default)]
