@@ -62,6 +62,7 @@ fn map_border_color(color: crate::TextureColor) -> metal::MTLSamplerBorderColor 
         Tc::TransparentBlack => TransparentBlack,
         Tc::OpaqueBlack => OpaqueBlack,
         Tc::White => OpaqueWhite,
+        Tc::Custom(_) => panic!("Metal does not support custom sampler border color")
     }
 }
 

@@ -188,6 +188,7 @@ impl super::CommandEncoder {
                         let clear_depth = match color {
                             crate::TextureColor::TransparentBlack
                             | crate::TextureColor::OpaqueBlack => 0.0,
+                            | crate::TextureColor::Custom(_) => 0.0,
                             crate::TextureColor::White => 1.0,
                         };
                         at_descriptor.set_clear_depth(clear_depth);
@@ -683,6 +684,12 @@ fn map_clear_color(color: crate::TextureColor) -> metal::MTLClearColor {
             green: 1.0,
             blue: 1.0,
             alpha: 1.0,
+        },
+        crate::TextureColor::Custom(c) => metal::MTLClearColor {
+            red: c[0] as f64,
+            green: c[1] as f64,
+            blue: c[2] as f64,
+            alpha: c[3] as f64,
         },
     }
 }
