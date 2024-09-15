@@ -130,10 +130,14 @@ unsafe fn inspect_adapter(
             return None;
         }
 
-        let surface_info = vk::PhysicalDeviceSurfaceInfo2KHR {
-            surface,
-            ..Default::default()
-        };
+        let mut win32fullscreen = vk::SurfaceFullScreenExclusiveWin32InfoEXT::default();
+
+        let mut surface_info = vk::PhysicalDeviceSurfaceInfo2KHR { surface, ..Default::default() };
+        
+        if cfg!(windows) {
+            surface_info = surface_info.push_next(&mut win32fullscreen);
+        }
+        
         let mut fullscreen_exclusive_ext = vk::SurfaceCapabilitiesFullScreenExclusiveEXT::default();
         let mut capabilities2_khr =
             vk::SurfaceCapabilities2KHR::default().push_next(&mut fullscreen_exclusive_ext);
