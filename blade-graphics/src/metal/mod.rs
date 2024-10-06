@@ -387,6 +387,22 @@ fn map_vertex_format(
             metal::MTLVertexFormat::Int4,
             metal::MTLAttributeFormat::Int4,
         ),
+        crate::VertexFormat::U8 => (
+            metal::MTLVertexFormat::UCharNormalized,
+            metal::MTLAttributeFormat::UCharNormalized,
+        ),
+        crate::VertexFormat::U8Vec2 => (
+            metal::MTLVertexFormat::UChar2Normalized,
+            metal::MTLAttributeFormat::UChar2Normalized,
+        ),
+        crate::VertexFormat::U8Vec3 => (
+            metal::MTLVertexFormat::UChar3Normalized,
+            metal::MTLAttributeFormat::UChar3Normalized,
+        ),
+        crate::VertexFormat::U8Vec4 => (
+            metal::MTLVertexFormat::UChar4Normalized,
+            metal::MTLAttributeFormat::UChar4Normalized,
+        ),
     }
 }
 

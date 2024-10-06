@@ -69,6 +69,18 @@ impl HasVertexAttribute for [i32; 3] {
 impl HasVertexAttribute for [i32; 4] {
     const FORMAT: VertexFormat = VertexFormat::I32Vec4;
 }
+impl HasVertexAttribute for u8 {
+    const FORMAT: VertexFormat = VertexFormat::U8;
+}
+impl HasVertexAttribute for [u8; 2] {
+    const FORMAT: VertexFormat = VertexFormat::U8Vec2;
+}
+impl HasVertexAttribute for [u8; 3] {
+    const FORMAT: VertexFormat = VertexFormat::U8Vec3;
+}
+impl HasVertexAttribute for [u8; 4] {
+    const FORMAT: VertexFormat = VertexFormat::U8Vec4;
+}
 
 impl HasVertexAttribute for mint::Vector2<f32> {
     const FORMAT: VertexFormat = VertexFormat::F32Vec2;
@@ -96,4 +108,13 @@ impl HasVertexAttribute for mint::Vector3<i32> {
 }
 impl HasVertexAttribute for mint::Vector4<i32> {
     const FORMAT: VertexFormat = VertexFormat::I32Vec4;
+}
+impl HasVertexAttribute for mint::Vector2<u8> {
+    const FORMAT: VertexFormat = VertexFormat::U8Vec2;
+}
+impl HasVertexAttribute for mint::Vector3<u8> {
+    const FORMAT: VertexFormat = VertexFormat::U8Vec3;
+}
+impl HasVertexAttribute for mint::Vector4<u8> {
+    const FORMAT: VertexFormat = VertexFormat::U8Vec4;
 }
