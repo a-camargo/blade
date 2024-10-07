@@ -568,6 +568,10 @@ fn map_vertex_format(vertex_format: crate::VertexFormat) -> vk::Format {
         Vf::I32Vec2 => vk::Format::R32G32_SINT,
         Vf::I32Vec3 => vk::Format::R32G32B32_SINT,
         Vf::I32Vec4 => vk::Format::R32G32B32A32_SINT,
+        Vf::U8 => vk::Format::R8_UNORM,
+        Vf::U8Vec2 => vk::Format::R8G8_UNORM,
+        Vf::U8Vec3 => vk::Format::R8G8B8_UNORM,
+        Vf::U8Vec4 => vk::Format::R8G8B8A8_UNORM,
     }
 }
 
