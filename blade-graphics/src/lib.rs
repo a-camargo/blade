@@ -287,7 +287,10 @@ pub enum TextureFormat {
     Rg32Uint,
     Rgba32Uint,
     // depth and stencil
+    Depth16UnormStencil8Uint,
+    Depth24UnormStencil8Uint,
     Depth32Float,
+    Depth32FloatStencil8Uint,
     // S3TC block compression
     Bc1Unorm,
     Bc1UnormSrgb,
