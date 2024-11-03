@@ -186,9 +186,9 @@ impl super::CommandEncoder {
                     crate::InitOp::Load => metal::MTLLoadAction::Load,
                     crate::InitOp::Clear(color) => {
                         let clear_depth = match color {
-                            crate::TextureColor::TransparentBlack
-                            | crate::TextureColor::OpaqueBlack => 0.0,
-                            | crate::TextureColor::Custom(_) => 0.0,
+                            crate::TextureColor::TransparentBlack => 0.0,
+                            | crate::TextureColor::OpaqueBlack => 1.0,
+                            | crate::TextureColor::Custom(_) => 1.0,
                             crate::TextureColor::White => 1.0,
                         };
                         at_descriptor.set_clear_depth(clear_depth);
