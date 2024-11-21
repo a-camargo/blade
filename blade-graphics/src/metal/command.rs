@@ -1,4 +1,4 @@
-use std::{marker::PhantomData, mem};
+use std::{marker::PhantomData, mem, time::Duration};
 
 impl<T: bytemuck::Pod> crate::ShaderBindable for T {
     fn bind_to(&self, ctx: &mut super::PipelineContext, index: u32) {
@@ -88,30 +88,52 @@ impl crate::ShaderBindable for crate::AccelerationStructure {
     }
 }
 
+impl super::TimingData {
+    fn add(&mut self, label: &str) -> u64 {
+        let counter_index = self.pass_names.len() as u64 * 2;
+        self.pass_names.push(label.to_string());
+        counter_index
+    }
+}
+
 impl super::CommandEncoder {
-    pub fn start(&mut self) {
-        let queue = self.queue.lock().unwrap();
-        self.raw = Some(objc::rc::autoreleasepool(|| {
-            let cmd_buf = queue.new_command_buffer_with_unretained_references();
-            if !self.name.is_empty() {
-                cmd_buf.set_label(&self.name);
+    fn begin_pass(&mut self, label: &str) {
+        if self.enable_debug_groups {
+            //HACK: close the previous group
+            if self.has_open_debug_group {
+                self.raw.as_mut().unwrap().pop_debug_group();
+            } else {
+                self.has_open_debug_group = true;
             }
-            cmd_buf.to_owned()
-        }));
+            self.raw.as_mut().unwrap().push_debug_group(label);
+        }
     }
 
-    pub fn init_texture(&mut self, _texture: super::Texture) {}
-
-    pub fn present(&mut self, frame: super::Frame) {
-        self.raw.as_mut().unwrap().present_drawable(&frame.drawable);
+    pub(super) fn finish(&mut self) -> metal::CommandBuffer {
+        if self.has_open_debug_group {
+            self.raw.as_mut().unwrap().pop_debug_group();
+        }
+        self.raw.take().unwrap()
     }
 
-    pub fn transfer(&mut self) -> super::TransferCommandEncoder {
+    pub fn transfer(&mut self, label: &str) -> super::TransferCommandEncoder {
+        self.begin_pass(label);
         let raw = objc::rc::autoreleasepool(|| {
+            let descriptor = metal::BlitPassDescriptor::new();
+
+            if let Some(ref mut td_array) = self.timing_datas {
+                let td = td_array.first_mut().unwrap();
+                let counter_index = td.add(label);
+                let sba = descriptor.sample_buffer_attachments().object_at(0).unwrap();
+                sba.set_sample_buffer(&td.sample_buffer);
+                sba.set_start_of_encoder_sample_index(counter_index);
+                sba.set_end_of_encoder_sample_index(counter_index + 1);
+            }
+
             self.raw
                 .as_mut()
                 .unwrap()
-                .new_blit_command_encoder()
+                .blit_command_encoder_with_descriptor(&descriptor)
                 .to_owned()
         });
         super::TransferCommandEncoder {
@@ -120,8 +142,22 @@ impl super::CommandEncoder {
         }
     }
 
-    pub fn acceleration_structure(&mut self) -> super::AccelerationStructureCommandEncoder {
+    pub fn acceleration_structure(
+        &mut self,
+        label: &str,
+    ) -> super::AccelerationStructureCommandEncoder {
         let raw = objc::rc::autoreleasepool(|| {
+            let descriptor = metal::AccelerationStructurePassDescriptor::new();
+
+            if let Some(ref mut td_array) = self.timing_datas {
+                let td = td_array.first_mut().unwrap();
+                let counter_index = td.add(label);
+                let sba = descriptor.sample_buffer_attachments().object_at(0).unwrap();
+                sba.set_sample_buffer(&td.sample_buffer);
+                sba.set_start_of_encoder_sample_index(counter_index);
+                sba.set_end_of_encoder_sample_index(counter_index + 1);
+            }
+
             self.raw
                 .as_mut()
                 .unwrap()
@@ -134,12 +170,26 @@ impl super::CommandEncoder {
         }
     }
 
-    pub fn compute(&mut self) -> super::ComputeCommandEncoder {
+    pub fn compute(&mut self, label: &str) -> super::ComputeCommandEncoder {
         let raw = objc::rc::autoreleasepool(|| {
+            let descriptor = metal::ComputePassDescriptor::new();
+            if self.enable_dispatch_type {
+                descriptor.set_dispatch_type(metal::MTLDispatchType::Concurrent);
+            }
+
+            if let Some(ref mut td_array) = self.timing_datas {
+                let td = td_array.first_mut().unwrap();
+                let counter_index = td.add(label);
+                let sba = descriptor.sample_buffer_attachments().object_at(0).unwrap();
+                sba.set_sample_buffer(&td.sample_buffer);
+                sba.set_start_of_encoder_sample_index(counter_index);
+                sba.set_end_of_encoder_sample_index(counter_index + 1);
+            }
+
             self.raw
                 .as_mut()
                 .unwrap()
-                .new_compute_command_encoder()
+                .compute_command_encoder_with_descriptor(&descriptor)
                 .to_owned()
         });
         super::ComputeCommandEncoder {
@@ -148,7 +198,11 @@ impl super::CommandEncoder {
         }
     }
 
-    pub fn render(&mut self, targets: crate::RenderTargetSet) -> super::RenderCommandEncoder {
+    pub fn render(
+        &mut self,
+        label: &str,
+        targets: crate::RenderTargetSet,
+    ) -> super::RenderCommandEncoder {
         let raw = objc::rc::autoreleasepool(|| {
             let descriptor = metal::RenderPassDescriptor::new();
 
@@ -206,6 +260,15 @@ impl super::CommandEncoder {
                 at_descriptor.set_store_action(store_action);
             }
 
+            if let Some(ref mut td_array) = self.timing_datas {
+                let td = td_array.first_mut().unwrap();
+                let counter_index = td.add(label);
+                let sba = descriptor.sample_buffer_attachments().object_at(0).unwrap();
+                sba.set_sample_buffer(&td.sample_buffer);
+                sba.set_start_of_vertex_sample_index(counter_index);
+                sba.set_end_of_fragment_sample_index(counter_index + 1);
+            }
+
             self.raw
                 .as_mut()
                 .unwrap()
@@ -217,6 +280,49 @@ impl super::CommandEncoder {
             raw,
             phantom: PhantomData,
         }
+    }
+}
+
+#[hidden_trait::expose]
+impl crate::traits::CommandEncoder for super::CommandEncoder {
+    type Texture = super::Texture;
+    type Frame = super::Frame;
+
+    fn start(&mut self) {
+        if let Some(ref mut td_array) = self.timing_datas {
+            self.timings.clear();
+            td_array.rotate_left(1);
+            let td = td_array.first_mut().unwrap();
+            if !td.pass_names.is_empty() {
+                let counters = td
+                    .sample_buffer
+                    .resolve_counter_range(metal::NSRange::new(0, td.pass_names.len() as u64 * 2));
+                for (name, chunk) in td.pass_names.drain(..).zip(counters.chunks(2)) {
+                    let duration = Duration::from_nanos(chunk[1] - chunk[0]);
+                    *self.timings.entry(name).or_default() += duration;
+                }
+            }
+        }
+
+        let queue = self.queue.lock().unwrap();
+        self.raw = Some(objc::rc::autoreleasepool(|| {
+            let cmd_buf = queue.new_command_buffer_with_unretained_references();
+            if !self.name.is_empty() {
+                cmd_buf.set_label(&self.name);
+            }
+            cmd_buf.to_owned()
+        }));
+        self.has_open_debug_group = false;
+    }
+
+    fn init_texture(&mut self, _texture: super::Texture) {}
+
+    fn present(&mut self, frame: super::Frame) {
+        self.raw.as_mut().unwrap().present_drawable(&frame.drawable);
+    }
+
+    fn timings(&self) -> &crate::Timings {
+        &self.timings
     }
 }
 

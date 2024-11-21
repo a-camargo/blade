@@ -12,14 +12,20 @@ mod pipeline;
 mod resource;
 mod surface;
 
-struct Surface {
+const MAX_TIMESTAMPS: u64 = crate::limits::PASS_COUNT as u64 * 2;
+
+pub type PlatformError = ();
+
+pub struct Surface {
     view: *mut objc::runtime::Object,
     render_layer: metal::MetalLayer,
+    info: crate::SurfaceInfo,
 }
 
 unsafe impl Send for Surface {}
 unsafe impl Sync for Surface {}
 
+#[derive(Debug)]
 pub struct Frame {
     drawable: metal::MetalDrawable,
     texture: metal::Texture,
@@ -39,16 +45,19 @@ impl Frame {
     }
 }
 
-struct DeviceInfo {
+#[derive(Debug, Clone)]
+struct PrivateInfo {
     language_version: metal::MTLLanguageVersion,
+    enable_debug_groups: bool,
+    enable_dispatch_type: bool,
+    timestamp_counter_set: Option<metal::CounterSet>,
 }
 
 pub struct Context {
     device: Mutex<metal::Device>,
     queue: Arc<Mutex<metal::CommandQueue>>,
-    surface: Option<Mutex<Surface>>,
     capture: Option<metal::CaptureManager>,
-    info: DeviceInfo,
+    info: PrivateInfo,
     device_information: crate::DeviceInformation,
 }
 
@@ -179,10 +188,21 @@ pub struct SyncPoint {
 }
 
 #[derive(Debug)]
+struct TimingData {
+    pass_names: Vec<String>,
+    sample_buffer: metal::CounterSampleBuffer,
+}
+
+#[derive(Debug)]
 pub struct CommandEncoder {
     raw: Option<metal::CommandBuffer>,
     name: String,
     queue: Arc<Mutex<metal::CommandQueue>>,
+    enable_debug_groups: bool,
+    enable_dispatch_type: bool,
+    has_open_debug_group: bool,
+    timing_datas: Option<Box<[TimingData]>>,
+    timings: crate::Timings,
 }
 
 #[derive(Debug)]
@@ -422,7 +442,8 @@ impl Context {
             .ok_or(super::NotSupportedError::NoSupportedDeviceFound)?;
         let queue = device.new_command_queue();
 
-        let capture = if desc.capture {
+        let auto_capture_everything = false;
+        let capture = if desc.capture && auto_capture_everything {
             objc::rc::autoreleasepool(|| {
                 let capture_manager = metal::CaptureManager::shared();
                 let default_capture_scope = capture_manager.new_capture_scope_with_device(&device);
@@ -441,41 +462,36 @@ impl Context {
             driver_info: "".to_string(),
         };
 
+        let mut timestamp_counter_set = None;
+        if desc.timing {
+            for counter_set in device.counter_sets() {
+                if counter_set.name() == "timestamp" {
+                    timestamp_counter_set = Some(counter_set);
+                }
+            }
+            if timestamp_counter_set.is_none() {
+                log::warn!("Timing counters are not supported by the device");
+            } else if !device
+                .supports_counter_sampling(metal::MTLCounterSamplingPoint::AtStageBoundary)
+            {
+                log::warn!("Timing counters do not support stage boundary");
+                timestamp_counter_set = None;
+            }
+        }
+
         Ok(Context {
             device: Mutex::new(device),
             queue: Arc::new(Mutex::new(queue)),
-            surface: None,
             capture,
-            info: DeviceInfo {
+            info: PrivateInfo {
                 //TODO: determine based on OS version
                 language_version: metal::MTLLanguageVersion::V2_4,
+                enable_debug_groups: desc.capture,
+                enable_dispatch_type: true,
+                timestamp_counter_set,
             },
             device_information,
         })
-    }
-
-    pub unsafe fn init_windowed<
-        I: raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle,
-    >(
-        window: &I,
-        desc: super::ContextDesc,
-    ) -> Result<Self, super::NotSupportedError> {
-        let mut context = Self::init(desc)?;
-
-        let surface = match window.window_handle().unwrap().as_raw() {
-            #[cfg(target_os = "ios")]
-            raw_window_handle::RawWindowHandle::UiKit(handle) => {
-                Surface::from_view(handle.ui_view.as_ptr() as *mut _)
-            }
-            #[cfg(target_os = "macos")]
-            raw_window_handle::RawWindowHandle::AppKit(handle) => {
-                Surface::from_view(handle.ns_view.as_ptr() as *mut _)
-            }
-            _ => return Err(crate::NotSupportedError::PlatformNotSupported),
-        };
-
-        context.surface = Some(Mutex::new(surface));
-        Ok(context)
     }
 
     pub fn capabilities(&self) -> crate::Capabilities {
@@ -497,14 +513,6 @@ impl Context {
         &self.device_information
     }
 
-    /// Get the CALayerMetal for this surface, if any.
-    /// This is platform specific API.
-    pub fn metal_layer(&self) -> Option<metal::MetalLayer> {
-        self.surface
-            .as_ref()
-            .map(|suf| suf.lock().unwrap().render_layer.clone())
-    }
-
     /// Get an MTLDevice of this context.
     /// This is platform specific API.
     pub fn metal_device(&self) -> metal::Device {
@@ -518,17 +526,45 @@ impl crate::traits::CommandDevice for Context {
     type SyncPoint = SyncPoint;
 
     fn create_command_encoder(&self, desc: super::CommandEncoderDesc) -> CommandEncoder {
+        let timing_datas = if let Some(ref counter_set) = self.info.timestamp_counter_set {
+            let mut array = Vec::with_capacity(desc.buffer_count as usize);
+            let csb_desc = metal::CounterSampleBufferDescriptor::new();
+            csb_desc.set_counter_set(counter_set);
+            csb_desc.set_storage_mode(metal::MTLStorageMode::Shared);
+            csb_desc.set_sample_count(MAX_TIMESTAMPS);
+            for i in 0..desc.buffer_count {
+                csb_desc.set_label(&format!("{}/counter{}", desc.name, i));
+                let sample_buffer = self
+                    .device
+                    .lock()
+                    .unwrap()
+                    .new_counter_sample_buffer_with_descriptor(&csb_desc)
+                    .unwrap();
+                array.push(TimingData {
+                    sample_buffer,
+                    pass_names: Vec::new(),
+                });
+            }
+            Some(array.into_boxed_slice())
+        } else {
+            None
+        };
         CommandEncoder {
             raw: None,
             name: desc.name.to_string(),
             queue: Arc::clone(&self.queue),
+            enable_debug_groups: self.info.enable_debug_groups,
+            enable_dispatch_type: self.info.enable_dispatch_type,
+            has_open_debug_group: false,
+            timing_datas,
+            timings: Default::default(),
         }
     }
 
     fn destroy_command_encoder(&self, _command_encoder: &mut CommandEncoder) {}
 
     fn submit(&self, encoder: &mut CommandEncoder) -> SyncPoint {
-        let cmd_buf = encoder.raw.take().unwrap();
+        let cmd_buf = encoder.finish();
         cmd_buf.commit();
         SyncPoint { cmd_buf }
     }

@@ -39,6 +39,7 @@ struct HitEntry {
     // packed color factor
     base_color_factor: u32,
     normal_texture: u32,
+    normal_scale: f32,
 }
 var<storage, read> hit_entries: array<HitEntry>;
 
@@ -67,6 +68,9 @@ fn debug_raw_normal(pos: vec3<f32>, normal_raw: u32, rotation: vec4<f32>, debug_
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if (any(global_id.xy >= camera.target_size)) {
         return;
+    }
+    if (WRITE_DEBUG_IMAGE && debug.view_mode != DebugMode_Final) {
+        textureStore(out_debug, global_id.xy, vec4<f32>(0.0));
     }
 
     var rq: ray_query;
@@ -122,8 +126,9 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         if ((debug.texture_flags & DebugTextureFlags_NORMAL) != 0u) {
             normal_local = vec3<f32>(0.0, 0.0, 1.0); // ignore normal map
         } else {
-            let n_xy = textureSampleLevel(textures[entry.normal_texture], sampler_linear, tex_coords, lod).xy;
-            normal_local = vec3<f32>(n_xy, sqrt(max(0.0, 1.0 - dot(n_xy.xy, n_xy.xy))));
+            let raw_unorm = textureSampleLevel(textures[entry.normal_texture], sampler_linear, tex_coords, lod).xy;
+            let n_xy = entry.normal_scale * (2.0 * raw_unorm - 1.0);
+            normal_local = vec3<f32>(n_xy, sqrt(max(0.0, 1.0 - dot(n_xy, n_xy))));
         }
         var normal = qrot(geo_to_world_rot, tangent_space_geo * normal_local);
         basis = shortest_arc_quat(vec3<f32>(0.0, 0.0, 1.0), normalize(normal));
@@ -139,11 +144,12 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             debug_buf.entry.flat_normal = flat_normal;
         }
         if (enable_debug && (debug.draw_flags & DebugDrawFlags_SPACE) != 0u) {
-            let normal_len = 0.15 * intersection.t;
-            let side = 0.05 * intersection.t;
-            debug_line(hit_position, hit_position + normal_len * qrot(geo_to_world_rot, normal_geo), 0xFFFFFFu);
-            debug_line(hit_position - side * tangent_geo, hit_position + side * tangent_geo, 0x808080u);
-            debug_line(hit_position - side * bitangent_geo, hit_position + side * bitangent_geo, 0x808080u);
+            let normal_w = 0.15 * intersection.t * qrot(geo_to_world_rot, normal_geo);
+            let tangent_w = 0.05 * intersection.t * qrot(geo_to_world_rot, tangent_geo);
+            let bitangent_w = 0.05 * intersection.t * qrot(geo_to_world_rot, bitangent_geo);
+            debug_line(hit_position, hit_position + normal_w, 0xFF8000u);
+            debug_line(hit_position - 0.5 * tangent_w, hit_position + tangent_w, 0x8080FFu);
+            debug_line(hit_position - 0.5 * bitangent_w, hit_position + bitangent_w, 0x80FF80u);
         }
         if (enable_debug && (debug.draw_flags & DebugDrawFlags_GEOMETRY) != 0u) {
             let debug_len = intersection.t * 0.2;
@@ -170,12 +176,32 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             albedo = (base_color_factor * base_color_sample).xyz;
         }
 
-        if (debug.view_mode == DebugMode_HitConsistency) {
-            let reprojected = get_projected_pixel(camera, hit_position);
-            let barycentrics_pos_diff = (intersection.object_to_world * position_object).xyz - hit_position;
-            let camera_projection_diff = vec2<f32>(global_id.xy) - vec2<f32>(reprojected);
-            let consistency = vec4<f32>(length(barycentrics_pos_diff), length(camera_projection_diff), 0.0, 0.0);
-            textureStore(out_debug, global_id.xy, consistency);
+        if (WRITE_DEBUG_IMAGE) {
+            if (debug.view_mode == DebugMode_DiffuseAlbedoTexture) {
+                textureStore(out_debug, global_id.xy, vec4<f32>(albedo, 0.0));
+            }
+            if (debug.view_mode == DebugMode_DiffuseAlbedoFactor) {
+                textureStore(out_debug, global_id.xy, base_color_factor);
+            }
+            if (debug.view_mode == DebugMode_NormalTexture) {
+                textureStore(out_debug, global_id.xy, vec4<f32>(normal_local, 0.0));
+            }
+            if (debug.view_mode == DebugMode_NormalScale) {
+                textureStore(out_debug, global_id.xy, vec4<f32>(entry.normal_scale));
+            }
+            if (debug.view_mode == DebugMode_GeometryNormal) {
+                textureStore(out_debug, global_id.xy, vec4<f32>(normal_geo, 0.0));
+            }
+            if (debug.view_mode == DebugMode_ShadingNormal) {
+                textureStore(out_debug, global_id.xy, vec4<f32>(normal, 0.0));
+            }
+            if (debug.view_mode == DebugMode_HitConsistency) {
+                let reprojected = get_projected_pixel(camera, hit_position);
+                let barycentrics_pos_diff = (intersection.object_to_world * position_object).xyz - hit_position;
+                let camera_projection_diff = vec2<f32>(global_id.xy) - vec2<f32>(reprojected);
+                let consistency = vec4<f32>(length(barycentrics_pos_diff), length(camera_projection_diff), 0.0, 0.0);
+                textureStore(out_debug, global_id.xy, consistency);
+            }
         }
 
         let prev_position = (entry.prev_object_to_world * position_object).xyz;
@@ -183,15 +209,12 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         //TODO: consider just storing integers here?
         //TODO: technically this "0.5" is just a waste compute on both packing and unpacking
         motion = prev_screen - vec2<f32>(global_id.xy) - 0.5;
-        if (debug.view_mode == DebugMode_Motion) {
+        if (WRITE_DEBUG_IMAGE && debug.view_mode == DebugMode_Motion) {
             textureStore(out_debug, global_id.xy, vec4<f32>(motion * MOTION_SCALE + vec2<f32>(0.5), 0.0, 1.0));
         }
     } else {
         if (enable_debug) {
             debug_buf.entry = DebugEntry();
-        }
-        if (debug.view_mode != DebugMode_Final) {
-            textureStore(out_debug, global_id.xy, vec4<f32>(0.0));
         }
     }
 

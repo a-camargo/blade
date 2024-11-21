@@ -52,39 +52,46 @@ struct Example {
     texture: gpu::Texture,
     view: gpu::TextureView,
     sampler: gpu::Sampler,
+    vertex_buf: gpu::Buffer,
     window_size: winit::dpi::PhysicalSize<u32>,
     bunnies: Vec<Sprite>,
     rng: nanorand::WyRand,
+    surface: gpu::Surface,
     context: gpu::Context,
-    vertex_buf: gpu::Buffer,
 }
 
 impl Example {
-    fn new(window: &winit::window::Window) -> Self {
-        let window_size = window.inner_size();
-        let context = unsafe {
-            gpu::Context::init_windowed(
-                window,
-                gpu::ContextDesc {
-                    validation: cfg!(debug_assertions),
-                    capture: false,
-                    overlay: true,
-                },
-            )
-            .unwrap()
-        };
-        println!("{:?}", context.device_information());
-
-        let surface_info = context.resize(gpu::SurfaceConfig {
+    fn make_surface_config(size: winit::dpi::PhysicalSize<u32>) -> gpu::SurfaceConfig {
+        log::info!("Window size: {:?}", size);
+        gpu::SurfaceConfig {
             size: gpu::Extent {
-                width: window_size.width,
-                height: window_size.height,
+                width: size.width,
+                height: size.height,
                 depth: 1,
             },
             usage: gpu::TextureUsage::TARGET,
             display_sync: gpu::DisplaySync::Recent,
             ..Default::default()
-        });
+        }
+    }
+
+    fn new(window: &winit::window::Window) -> Self {
+        let context = unsafe {
+            gpu::Context::init(gpu::ContextDesc {
+                presentation: true,
+                validation: cfg!(debug_assertions),
+                timing: false,
+                capture: false,
+                overlay: true,
+            })
+            .unwrap()
+        };
+        println!("{:?}", context.device_information());
+        let window_size = window.inner_size();
+
+        let surface = context
+            .create_surface_configured(window, Self::make_surface_config(window_size))
+            .unwrap();
 
         let global_layout = <Params as gpu::ShaderData>::layout();
         let local_layout = <SpriteData as gpu::ShaderData>::layout();
@@ -111,7 +118,7 @@ impl Example {
             depth_stencil: None,
             fragment: shader.at("fs_main"),
             color_targets: &[gpu::ColorTargetState {
-                format: surface_info.format,
+                format: surface.info().format,
                 blend: Some(gpu::BlendState::ALPHA_BLENDING),
                 write_mask: gpu::ColorWrites::default(),
             }],
@@ -200,7 +207,7 @@ impl Example {
         });
         command_encoder.start();
         command_encoder.init_texture(texture);
-        if let mut transfer = command_encoder.transfer() {
+        if let mut transfer = command_encoder.transfer("init texture") {
             transfer.copy_buffer_to_texture(upload_buffer.into(), 4, texture.into(), extent);
         }
         let sync_point = context.submit(&mut command_encoder);
@@ -215,12 +222,19 @@ impl Example {
             texture,
             view,
             sampler,
+            vertex_buf,
             window_size,
             bunnies,
             rng: nanorand::WyRand::new_seed(73),
+            surface,
             context,
-            vertex_buf,
         }
+    }
+
+    fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
+        self.window_size = size;
+        let config = Self::make_surface_config(size);
+        self.context.reconfigure_surface(&mut self.surface, config);
     }
 
     fn increase(&mut self) {
@@ -273,19 +287,25 @@ impl Example {
     }
 
     fn render(&mut self) {
-        let frame = self.context.acquire_frame();
+        if self.window_size == Default::default() {
+            return;
+        }
+        let frame = self.surface.acquire_frame();
 
         self.command_encoder.start();
         self.command_encoder.init_texture(frame.texture());
 
-        if let mut pass = self.command_encoder.render(gpu::RenderTargetSet {
-            colors: &[gpu::RenderTarget {
-                view: frame.texture_view(),
-                init_op: gpu::InitOp::Clear(gpu::TextureColor::TransparentBlack),
-                finish_op: gpu::FinishOp::Store,
-            }],
-            depth_stencil: None,
-        }) {
+        if let mut pass = self.command_encoder.render(
+            "main",
+            gpu::RenderTargetSet {
+                colors: &[gpu::RenderTarget {
+                    view: frame.texture_view(),
+                    init_op: gpu::InitOp::Clear(gpu::TextureColor::OpaqueBlack),
+                    finish_op: gpu::FinishOp::Store,
+                }],
+                depth_stencil: None,
+            },
+        ) {
             let mut rc = pass.with(&self.pipeline);
             rc.bind(
                 0,
@@ -326,13 +346,14 @@ impl Example {
         if let Some(sp) = self.prev_sync_point.take() {
             self.context.wait_for(&sp, !0);
         }
-        self.context.destroy_buffer(self.vertex_buf);
         self.context.destroy_texture_view(self.view);
         self.context.destroy_texture(self.texture);
         self.context.destroy_sampler(self.sampler);
+        self.context.destroy_buffer(self.vertex_buf);
         self.context
             .destroy_command_encoder(&mut self.command_encoder);
         self.context.destroy_render_pipeline(&mut self.pipeline);
+        self.context.destroy_surface(&mut self.surface);
     }
 }
 
@@ -341,19 +362,20 @@ fn main() {
     env_logger::init();
 
     let event_loop = winit::event_loop::EventLoop::new().unwrap();
-    let window = winit::window::WindowBuilder::new()
-        .with_title("blade-bunnymark")
-        .build(&event_loop)
-        .unwrap();
+    let window_attributes =
+        winit::window::Window::default_attributes().with_title("blade-bunnymark");
+
+    let window = event_loop.create_window(window_attributes).unwrap();
 
     #[cfg(target_arch = "wasm32")]
     {
         use winit::platform::web::WindowExtWebSys as _;
 
-        std::panic::set_hook(Box::new(console_error_panic_hook::hook));
+        console_error_panic_hook::set_once();
         console_log::init().expect("could not initialize logger");
         // On wasm, append the canvas to the document body
         let canvas = window.canvas().unwrap();
+        canvas.set_id(gpu::CANVAS_ID);
         web_sys::window()
             .and_then(|win| win.document())
             .and_then(|doc| doc.body())
@@ -379,6 +401,9 @@ fn main() {
                     window.request_redraw();
                 }
                 winit::event::Event::WindowEvent { event, .. } => match event {
+                    winit::event::WindowEvent::Resized(size) => {
+                        example.resize(size);
+                    }
                     #[cfg(not(target_arch = "wasm32"))]
                     winit::event::WindowEvent::KeyboardInput {
                         event:

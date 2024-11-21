@@ -4,14 +4,12 @@
 use blade_graphics as gpu;
 use blade_helpers::ControlledCamera;
 use std::{
-    collections::VecDeque,
     fmt, fs,
     path::{Path, PathBuf},
     sync::Arc,
     time,
 };
 
-const FRAME_TIME_HISTORY: usize = 30;
 const RENDER_WHILE_LOADING: bool = true;
 const MAX_DEPTH: f32 = 1e9;
 
@@ -142,6 +140,7 @@ struct Example {
     gui_painter: blade_egui::GuiPainter,
     asset_hub: blade_render::AssetHub,
     context: Arc<gpu::Context>,
+    surface: gpu::Surface,
     environment_map: Option<blade_asset::Handle<blade_render::Texture>>,
     objects: Vec<blade_render::Object>,
     object_extras: Vec<ObjectExtra>,
@@ -156,8 +155,6 @@ struct Example {
     need_accumulation_reset: bool,
     is_point_selected: bool,
     is_file_hovered: bool,
-    last_render_time: time::Instant,
-    render_times: VecDeque<u32>,
     ray_config: blade_render::RayConfig,
     denoiser_enabled: bool,
     denoiser_config: blade_render::DenoiserConfig,
@@ -187,20 +184,21 @@ impl Example {
         log::info!("Initializing");
 
         let context = Arc::new(unsafe {
-            gpu::Context::init_windowed(
-                window,
-                gpu::ContextDesc {
-                    validation: cfg!(debug_assertions),
-                    capture: false,
-                    overlay: false,
-                },
-            )
+            gpu::Context::init(gpu::ContextDesc {
+                presentation: true,
+                validation: cfg!(debug_assertions),
+                capture: true,
+                ..Default::default()
+            })
             .unwrap()
         });
 
         let surface_config = Self::make_surface_config(window.inner_size());
         let surface_size = surface_config.size;
-        let surface_info = context.resize(surface_config);
+        let surface = context
+            .create_surface_configured(window, surface_config)
+            .unwrap();
+        let surface_info = surface.info();
 
         let num_workers = num_cpus::get_physical().max((num_cpus::get() * 3 + 2) / 4);
         log::info!("Initializing Choir with {} workers", num_workers);
@@ -241,6 +239,7 @@ impl Example {
             gui_painter,
             asset_hub,
             context,
+            surface,
             environment_map: None,
             objects: Vec::new(),
             object_extras: Vec::new(),
@@ -251,22 +250,11 @@ impl Example {
             scene_revision: 0,
             camera: ControlledCamera::default(),
             debug: blade_render::DebugConfig::default(),
-            track_hot_reloads: false,
+            track_hot_reloads: true,
             need_accumulation_reset: true,
             is_point_selected: false,
             is_file_hovered: false,
-            last_render_time: time::Instant::now(),
-            render_times: VecDeque::with_capacity(FRAME_TIME_HISTORY),
-            ray_config: blade_render::RayConfig {
-                num_environment_samples: 1,
-                environment_importance_sampling: false,
-                temporal_tap: true,
-                temporal_history: 10,
-                spatial_taps: 1,
-                spatial_tap_history: 5,
-                spatial_radius: 10,
-                t_start: 0.1,
-            },
+            ray_config: blade_helpers::default_ray_config(),
             denoiser_enabled: true,
             denoiser_config: blade_render::DenoiserConfig {
                 num_passes: 3,
@@ -290,6 +278,7 @@ impl Example {
         self.gui_painter.destroy(&self.context);
         self.renderer.destroy(&self.context);
         self.asset_hub.destroy();
+        self.context.destroy_surface(&mut self.surface);
     }
 
     pub fn load_scene(&mut self, scene_path: &Path) {
@@ -417,7 +406,8 @@ impl Example {
         if new_render_size != self.renderer.get_surface_size() {
             log::info!("Resizing to {}", new_render_size);
             self.pacer.wait_for_previous_frame(&self.context);
-            self.context.resize(surface_config);
+            self.context
+                .reconfigure_surface(&mut self.surface, surface_config);
         }
 
         let (command_encoder, temp) = self.pacer.begin_frame();
@@ -482,17 +472,20 @@ impl Example {
             }
         }
 
-        let frame = self.context.acquire_frame();
+        let frame = self.surface.acquire_frame();
         command_encoder.init_texture(frame.texture());
 
-        if let mut pass = command_encoder.render(gpu::RenderTargetSet {
-            colors: &[gpu::RenderTarget {
-                view: frame.texture_view(),
-                init_op: gpu::InitOp::Clear(gpu::TextureColor::TransparentBlack),
-                finish_op: gpu::FinishOp::Store,
-            }],
-            depth_stencil: None,
-        }) {
+        if let mut pass = command_encoder.render(
+            "draw",
+            gpu::RenderTargetSet {
+                colors: &[gpu::RenderTarget {
+                    view: frame.texture_view(),
+                    init_op: gpu::InitOp::Clear(gpu::TextureColor::TransparentBlack),
+                    finish_op: gpu::FinishOp::Store,
+                }],
+                depth_stencil: None,
+            },
+        ) {
             let screen_desc = blade_egui::ScreenDescriptor {
                 physical_size: (physical_size.width, physical_size.height),
                 scale_factor,
@@ -562,13 +555,6 @@ impl Example {
     fn populate_view(&mut self, ui: &mut egui::Ui) {
         use blade_helpers::{populate_debug_selection, ExposeHud as _};
         use strum::IntoEnumIterator as _;
-
-        let delta = self.last_render_time.elapsed();
-        self.last_render_time += delta;
-        while self.render_times.len() >= FRAME_TIME_HISTORY {
-            self.render_times.pop_back();
-        }
-        self.render_times.push_front(delta.as_millis() as u32);
 
         if self.scene_load_task.is_some() {
             ui.horizontal(|ui| {
@@ -675,30 +661,6 @@ impl Example {
 
         egui::CollapsingHeader::new("Tone Map").show(ui, |ui| {
             self.post_proc_config.populate_hud(ui);
-        });
-
-        egui::CollapsingHeader::new("Performance").show(ui, |ui| {
-            let times = self.render_times.as_slices();
-            let fd_points = egui_plot::PlotPoints::from_iter(
-                times
-                    .0
-                    .iter()
-                    .chain(times.1.iter())
-                    .enumerate()
-                    .map(|(x, &y)| [x as f64, y as f64]),
-            );
-            let fd_line = egui_plot::Line::new(fd_points).name("last");
-            egui_plot::Plot::new("Frame time")
-                .allow_zoom(false)
-                .allow_scroll(false)
-                .allow_drag(false)
-                .show_x(false)
-                .include_y(0.0)
-                .show_axes([false, true])
-                .show(ui, |plot_ui| {
-                    plot_ui.line(fd_line);
-                    plot_ui.hline(egui_plot::HLine::new(1000.0 / 60.0).name("smooth"));
-                });
         });
     }
 
@@ -835,14 +797,13 @@ fn main() {
     env_logger::init();
 
     let event_loop = winit::event_loop::EventLoop::new().unwrap();
-    let window = winit::window::WindowBuilder::new()
-        .with_title("blade-scene")
-        .build(&event_loop)
-        .unwrap();
+    let window_attributes = winit::window::Window::default_attributes().with_title("blade-scene");
+
+    let window = event_loop.create_window(window_attributes).unwrap();
 
     let egui_ctx = egui::Context::default();
     let viewport_id = egui_ctx.viewport_id();
-    let mut egui_winit = egui_winit::State::new(egui_ctx, viewport_id, &window, None, None);
+    let mut egui_winit = egui_winit::State::new(egui_ctx, viewport_id, &window, None, None, None);
 
     let mut args = std::env::args();
     let path_to_scene = args
@@ -944,6 +905,9 @@ fn main() {
                                 example.debug.mouse_pos = None;
                             }
                             last_mouse_pos = [position.x as i32, position.y as i32];
+                        }
+                        winit::event::WindowEvent::MouseWheel { delta, .. } => {
+                            example.camera.on_wheel(delta);
                         }
                         winit::event::WindowEvent::HoveredFile(_) => {
                             example.is_file_hovered = true;

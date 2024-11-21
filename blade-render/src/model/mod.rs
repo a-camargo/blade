@@ -15,7 +15,8 @@ const META_BASE_COLOR: crate::texture::Meta = crate::texture::Meta {
     y_flip: false,
 };
 const META_NORMAL: crate::texture::Meta = crate::texture::Meta {
-    format: blade_graphics::TextureFormat::Bc5Snorm,
+    //Note: "texpresso" doesn't know how to produce signed normalized
+    format: blade_graphics::TextureFormat::Bc5Unorm,
     generate_mips: false,
     y_flip: false,
 };
@@ -45,6 +46,7 @@ pub struct Material {
     pub base_color_texture: Option<blade_asset::Handle<crate::Texture>>,
     pub base_color_factor: [f32; 4],
     pub normal_texture: Option<blade_asset::Handle<crate::Texture>>,
+    pub normal_scale: f32,
     pub transparent: bool,
 }
 
@@ -72,6 +74,7 @@ struct CookedMaterial<'a> {
     base_color: TextureReference<'a>,
     base_color_factor: [f32; 4],
     normal: TextureReference<'a>,
+    normal_scale: f32,
     transparent: bool,
 }
 
@@ -381,7 +384,7 @@ impl Baker {
     ) {
         let mut pending_ops = self.pending_operations.lock().unwrap();
         if !pending_ops.transfers.is_empty() {
-            let mut pass = encoder.transfer();
+            let mut pass = encoder.transfer("init models");
             for transfer in pending_ops.transfers.drain(..) {
                 pass.copy_buffer_to_buffer(
                     transfer.stage.into(),
@@ -392,7 +395,7 @@ impl Baker {
             }
         }
         if !pending_ops.blas_constructs.is_empty() {
-            let mut pass = encoder.acceleration_structure();
+            let mut pass = encoder.acceleration_structure("BLAS");
             for construct in pending_ops.blas_constructs.drain(..) {
                 pass.build_bottom_level(construct.dst, &construct.meshes, construct.scratch.into());
                 temp_buffers.push(construct.scratch);
@@ -549,7 +552,7 @@ impl blade_asset::Baker for Baker {
                         },
                         base_color_factor: pbr.base_color_factor(),
                         normal: TextureReference {
-                            source_index: match pbr.base_color_texture() {
+                            source_index: match g_material.normal_texture() {
                                 Some(info) => sources.insert(self.cook_texture(
                                     info.texture(),
                                     META_NORMAL,
@@ -560,6 +563,7 @@ impl blade_asset::Baker for Baker {
                             },
                             ..Default::default()
                         },
+                        normal_scale: g_material.normal_texture().map_or(0.0, |info| info.scale()),
                         transparent: g_material.alpha_mode() != gltf::material::AlphaMode::Opaque,
                     });
                 }
@@ -631,6 +635,7 @@ impl blade_asset::Baker for Baker {
                 ),
                 base_color_factor: material.base_color_factor,
                 normal_texture: self.serve_texture(&material.normal, META_NORMAL, exe_context),
+                normal_scale: material.normal_scale,
                 transparent: material.transparent,
             });
         }

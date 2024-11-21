@@ -6,6 +6,15 @@ mod descriptor;
 mod init;
 mod pipeline;
 mod resource;
+mod surface;
+
+const QUERY_POOL_SIZE: usize = crate::limits::PASS_COUNT + 1;
+
+#[derive(Debug)]
+pub enum PlatformError {
+    Loading(ash::LoadingError),
+    Init(vk::Result),
+}
 
 struct Instance {
     core: ash::Instance,
@@ -20,6 +29,13 @@ struct RayTracingDevice {
     acceleration_structure: khr::acceleration_structure::Device,
 }
 
+#[derive(Clone, Default)]
+struct CommandScopeDevice {}
+#[derive(Clone, Default)]
+struct TimingDevice {
+    period: f32,
+}
+
 #[derive(Clone)]
 struct Workarounds {
     extra_sync_src_access: vk::AccessFlags,
@@ -31,6 +47,7 @@ struct Workarounds {
 struct Device {
     core: ash::Device,
     device_information: crate::DeviceInformation,
+    swapchain: Option<khr::swapchain::Device>,
     debug_utils: ash::ext::debug_utils::Device,
     timeline_semaphore: khr::timeline_semaphore::Device,
     dynamic_rendering: khr::dynamic_rendering::Device,
@@ -38,6 +55,8 @@ struct Device {
     buffer_marker: Option<ash::amd::buffer_marker::Device>,
     shader_info: Option<ash::amd::shader_info::Device>,
     full_screen_exclusive: Option<ash::ext::full_screen_exclusive::Device>,
+    command_scope: Option<CommandScopeDevice>,
+    timing: Option<TimingDevice>,
     workarounds: Workarounds,
 }
 
@@ -54,41 +73,61 @@ struct Queue {
     last_progress: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Frame {
-    image_index: u32,
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct InternalFrame {
+    acquire_semaphore: vk::Semaphore,
     image: vk::Image,
     view: vk::ImageView,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Swapchain {
+    raw: vk::SwapchainKHR,
     format: crate::TextureFormat,
-    acquire_semaphore: vk::Semaphore,
+    alpha: crate::AlphaMode,
     target_size: [u16; 2],
+}
+
+pub struct Surface {
+    device: khr::swapchain::Device,
+    raw: vk::SurfaceKHR,
+    frames: Vec<InternalFrame>,
+    next_semaphore: vk::Semaphore,
+    swapchain: Swapchain,
+    full_screen_exclusive: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Presentation {
+    swapchain: vk::SwapchainKHR,
+    image_index: u32,
+    acquire_semaphore: vk::Semaphore,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Frame {
+    swapchain: Swapchain,
+    image_index: u32,
+    internal: InternalFrame,
 }
 
 impl Frame {
     pub fn texture(&self) -> Texture {
         Texture {
-            raw: self.image,
+            raw: self.internal.image,
             memory_handle: !0,
-            target_size: self.target_size,
-            format: self.format,
+            target_size: self.swapchain.target_size,
+            format: self.swapchain.format,
         }
     }
 
     pub fn texture_view(&self) -> TextureView {
         TextureView {
-            raw: self.view,
-            target_size: self.target_size,
+            raw: self.internal.view,
+            target_size: self.swapchain.target_size,
             aspects: crate::TexelAspects::COLOR,
         }
     }
-}
-
-struct Surface {
-    raw: vk::SurfaceKHR,
-    frames: Vec<Frame>,
-    next_semaphore: vk::Semaphore,
-    swapchain: vk::SwapchainKHR,
-    extension: khr::swapchain::Device,
 }
 
 fn map_timeout(millis: u32) -> u64 {
@@ -104,12 +143,11 @@ pub struct Context {
     device: Device,
     queue_family_index: u32,
     queue: Mutex<Queue>,
-    surface: Option<Mutex<Surface>>,
     physical_device: vk::PhysicalDevice,
     naga_flags: naga::back::spv::WriterFlags,
     shader_debug_path: Option<PathBuf>,
     instance: Instance,
-    _entry: ash::Entry,
+    entry: ash::Entry,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq)]
@@ -217,12 +255,8 @@ pub struct RenderPipeline {
 struct CommandBuffer {
     raw: vk::CommandBuffer,
     descriptor_pool: descriptor::DescriptorPool,
-}
-
-#[derive(Debug, PartialEq)]
-struct Presentation {
-    image_index: u32,
-    acquire_semaphore: vk::Semaphore,
+    query_pool: vk::QueryPool,
+    timed_pass_names: Vec<String>,
 }
 
 struct CrashHandler {
@@ -239,6 +273,8 @@ pub struct CommandEncoder {
     update_data: Vec<u8>,
     present: Option<Presentation>,
     crash_handler: Option<CrashHandler>,
+    temp_label: Vec<u8>,
+    timings: crate::Timings,
 }
 pub struct TransferCommandEncoder<'a> {
     raw: vk::CommandBuffer,
@@ -338,9 +374,24 @@ impl crate::traits::CommandDevice for Context {
                     self.set_object_name(raw, desc.name);
                 };
                 let descriptor_pool = self.device.create_descriptor_pool();
+                let query_pool = if self.device.timing.is_some() {
+                    let query_pool_info = vk::QueryPoolCreateInfo::default()
+                        .query_type(vk::QueryType::TIMESTAMP)
+                        .query_count(QUERY_POOL_SIZE as u32);
+                    unsafe {
+                        self.device
+                            .core
+                            .create_query_pool(&query_pool_info, None)
+                            .unwrap()
+                    }
+                } else {
+                    vk::QueryPool::null()
+                };
                 CommandBuffer {
                     raw,
                     descriptor_pool,
+                    query_pool,
+                    timed_pass_names: Vec::new(),
                 }
             })
             .collect();
@@ -367,6 +418,8 @@ impl crate::traits::CommandDevice for Context {
             update_data: Vec::new(),
             present: None,
             crash_handler,
+            temp_label: Vec::new(),
+            timings: Default::default(),
         }
     }
 
@@ -380,6 +433,13 @@ impl crate::traits::CommandDevice for Context {
             }
             self.device
                 .destroy_descriptor_pool(&mut cmd_buf.descriptor_pool);
+            if self.device.timing.is_some() {
+                unsafe {
+                    self.device
+                        .core
+                        .destroy_query_pool(cmd_buf.query_pool, None);
+                }
+            }
         }
         unsafe {
             self.device
@@ -426,15 +486,15 @@ impl crate::traits::CommandDevice for Context {
         encoder.check_gpu_crash(ret);
 
         if let Some(presentation) = encoder.present.take() {
-            let surface = self.surface.as_ref().unwrap().lock().unwrap();
-            let swapchains = [surface.swapchain];
+            let khr_swapchain = self.device.swapchain.as_ref().unwrap();
+            let swapchains = [presentation.swapchain];
             let image_indices = [presentation.image_index];
             let wait_semaphores = [queue.present_semaphore];
             let present_info = vk::PresentInfoKHR::default()
                 .swapchains(&swapchains)
                 .image_indices(&image_indices)
                 .wait_semaphores(&wait_semaphores);
-            let ret = unsafe { surface.extension.queue_present(queue.raw, &present_info) };
+            let ret = unsafe { khr_swapchain.queue_present(queue.raw, &present_info) };
             let _ = encoder.check_gpu_crash(ret);
         }
 

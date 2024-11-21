@@ -5,23 +5,46 @@ mod pipeline;
 mod platform;
 mod resource;
 
+use std::{marker::PhantomData, mem, ops::Range};
+
 type BindTarget = u32;
-
-pub use platform::Context;
-use std::{marker::PhantomData, ops::Range};
-
 const DEBUG_ID: u32 = 0;
+const MAX_TIMEOUT: u64 = 1_000_000_000; // MAX_CLIENT_WAIT_TIMEOUT_WEBGL;
+const MAX_QUERIES: usize = crate::limits::PASS_COUNT + 1;
+
+pub use platform::PlatformError;
 
 bitflags::bitflags! {
     struct Capabilities: u32 {
         const BUFFER_STORAGE = 1 << 0;
         const DRAW_BUFFERS_INDEXED = 1 << 1;
+        const DISJOINT_TIMER_QUERY = 1 << 2;
     }
 }
 
 #[derive(Clone, Debug)]
 struct Limits {
     uniform_buffer_alignment: u32,
+}
+
+#[derive(Debug, Default)]
+struct Toggles {
+    scoping: bool,
+    timing: bool,
+}
+
+pub struct Context {
+    platform: platform::PlatformContext,
+    capabilities: Capabilities,
+    toggles: Toggles,
+    limits: Limits,
+    device_information: crate::DeviceInformation,
+}
+
+pub struct Surface {
+    platform: platform::PlatformSurface,
+    renderbuf: glow::Renderbuffer,
+    framebuf: glow::Framebuffer,
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq)]
@@ -120,7 +143,9 @@ pub struct RenderPipeline {
     topology: crate::PrimitiveTopology,
 }
 
+#[derive(Debug)]
 pub struct Frame {
+    platform: platform::PlatformFrame,
     texture: Texture,
 }
 
@@ -332,19 +357,34 @@ enum Command {
         binding: ImageBinding,
     },
     ResetAllSamplers,
+    QueryCounter {
+        query: glow::Query,
+    },
+    PushScope {
+        name_range: Range<usize>,
+    },
+    PopScope,
+}
+
+struct TimingData {
+    pass_names: Vec<String>,
+    queries: Box<[glow::Query]>,
 }
 
 pub struct CommandEncoder {
     name: String,
     commands: Vec<Command>,
     plain_data: Vec<u8>,
-    has_present: bool,
+    string_data: Vec<u8>,
+    needs_scopes: bool,
+    present_frames: Vec<platform::PlatformFrame>,
     limits: Limits,
+    timing_datas: Option<Box<[TimingData]>>,
+    timings: crate::Timings,
 }
 
 enum PassKind {
     Transfer,
-    AccelerationStructure,
     Compute,
     Render,
 }
@@ -356,6 +396,7 @@ pub struct PassEncoder<'a, P> {
     invalidate_attachments: Vec<u32>,
     pipeline: PhantomData<P>,
     limits: &'a Limits,
+    has_scope: bool,
 }
 
 pub type ComputeCommandEncoder<'a> = PassEncoder<'a, ComputePipeline>;
@@ -396,6 +437,7 @@ pub struct SyncPoint {
 struct ExecutionContext {
     framebuf: glow::Framebuffer,
     plain_buffer: glow::Buffer,
+    string_data: Box<[u8]>,
 }
 
 impl Context {
@@ -416,22 +458,58 @@ impl crate::traits::CommandDevice for Context {
     type SyncPoint = SyncPoint;
 
     fn create_command_encoder(&self, desc: super::CommandEncoderDesc) -> CommandEncoder {
+        use glow::HasContext as _;
+
+        let timing_datas = if self.toggles.timing {
+            let gl = self.lock();
+            let mut array = Vec::new();
+            // Allocating one extra set of timers because we are resolving them
+            // in submit() as opposed to start().
+            for _ in 0..desc.buffer_count + 1 {
+                array.push(TimingData {
+                    pass_names: Vec::new(),
+                    queries: (0..MAX_QUERIES)
+                        .map(|_| unsafe { gl.create_query().unwrap() })
+                        .collect(),
+                });
+            }
+            Some(array.into_boxed_slice())
+        } else {
+            None
+        };
         CommandEncoder {
             name: desc.name.to_string(),
             commands: Vec::new(),
             plain_data: Vec::new(),
-            has_present: false,
+            string_data: Vec::new(),
+            needs_scopes: self.toggles.scoping,
+            present_frames: Vec::new(),
             limits: self.limits.clone(),
+            timing_datas,
+            timings: Default::default(),
         }
     }
 
-    fn destroy_command_encoder(&self, _command_encoder: &mut CommandEncoder) {}
+    fn destroy_command_encoder(&self, encoder: &mut CommandEncoder) {
+        use glow::HasContext as _;
+
+        if let Some(timing_datas) = encoder.timing_datas.take() {
+            let gl = self.lock();
+            for td in timing_datas {
+                for query in td.queries {
+                    unsafe { gl.delete_query(query) };
+                }
+            }
+        }
+    }
 
     fn submit(&self, encoder: &mut CommandEncoder) -> SyncPoint {
         use glow::HasContext as _;
 
         let fence = {
             let gl = self.lock();
+            encoder.finish(&gl);
+
             let push_group = !encoder.name.is_empty() && gl.supports_debug();
             let ec = unsafe {
                 if push_group {
@@ -452,6 +530,7 @@ impl crate::traits::CommandDevice for Context {
                 ExecutionContext {
                     framebuf,
                     plain_buffer,
+                    string_data: mem::take(&mut encoder.string_data).into_boxed_slice(),
                 }
             };
             for command in encoder.commands.iter() {
@@ -467,8 +546,8 @@ impl crate::traits::CommandDevice for Context {
                 gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0).unwrap()
             }
         };
-        if encoder.has_present {
-            self.present();
+        for frame in encoder.present_frames.drain(..) {
+            self.platform.present(frame);
         }
         SyncPoint { fence }
     }
@@ -483,7 +562,7 @@ impl crate::traits::CommandDevice for Context {
             timeout_ms as u64 * 1_000_000
         };
         //TODO: https://github.com/grovesNL/glow/issues/287
-        let timeout_ns_i32 = timeout_ns.min(std::i32::MAX as u64) as i32;
+        let timeout_ns_i32 = timeout_ns.min(MAX_TIMEOUT) as i32;
 
         let status =
             unsafe { gl.client_wait_sync(sp.fence, glow::SYNC_FLUSH_COMMANDS_BIT, timeout_ns_i32) };
@@ -559,4 +638,31 @@ fn map_compare_func(fun: crate::CompareFunction) -> u32 {
         Cf::NotEqual => glow::NOTEQUAL,
         Cf::Always => glow::ALWAYS,
     }
+}
+
+unsafe fn present_blit(gl: &glow::Context, source: glow::Framebuffer, size: crate::Extent) {
+    use glow::HasContext as _;
+
+    gl.disable(glow::SCISSOR_TEST);
+    gl.color_mask(true, true, true, true);
+    gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
+    gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(source));
+    // Note: the Y-flipping here. GL's presentation is not flipped,
+    // but main rendering is. Therefore, we Y-flip the output positions
+    // in the shader, and also this blit.
+    // Note2: we could avoid doing both and get correct rendering for the main window
+    // but then other render targets would be screwed.
+    gl.blit_framebuffer(
+        0,
+        size.height as i32,
+        size.width as i32,
+        0,
+        0,
+        0,
+        size.width as i32,
+        size.height as i32,
+        glow::COLOR_BUFFER_BIT,
+        glow::NEAREST,
+    );
+    gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
 }

@@ -72,21 +72,34 @@ mod shader;
 mod traits;
 pub mod util;
 pub mod limits {
+    /// Max number of passes inside a command encoder.
+    pub const PASS_COUNT: usize = 100;
+    /// Max plain data size for a pipeline.
     pub const PLAIN_DATA_SIZE: u32 = 256;
+    /// Max number of resources in a bind group.
     pub const RESOURCES_IN_GROUP: u32 = 8;
+    /// Min storage buffer alignment.
     pub const STORAGE_BUFFER_ALIGNMENT: u64 = 256;
+    /// Min acceleration structure scratch buffer alignment.
     pub const ACCELERATION_STRUCTURE_SCRATCH_ALIGNMENT: u64 = 256;
 }
 
 pub use hal::*;
 
+#[cfg(target_arch = "wasm32")]
+pub const CANVAS_ID: &str = "blade";
+
 use std::{fmt, num::NonZeroU32};
 
 #[derive(Clone, Debug, Default)]
 pub struct ContextDesc {
+    /// Ability to present contents to a window.
+    pub presentation: bool,
     /// Enable validation of the GAPI, shaders,
     /// and insert crash markers into command buffers.
     pub validation: bool,
+    /// Enable GPU timing of all passes.
+    pub timing: bool,
     /// Enable capture support with GAPI tools.
     pub capture: bool,
     /// Enable GAPI overlay.
@@ -95,36 +108,15 @@ pub struct ContextDesc {
 
 #[derive(Debug)]
 pub enum NotSupportedError {
-    #[cfg(all(
-        not(gles),
-        any(
-            vulkan,
-            windows,
-            target_os = "linux",
-            target_os = "android",
-            target_os = "freebsd"
-        )
-    ))]
-    VulkanLoadingError(ash::LoadingError),
-    #[cfg(all(
-        not(gles),
-        any(
-            vulkan,
-            windows,
-            target_os = "linux",
-            target_os = "android",
-            target_os = "freebsd"
-        )
-    ))]
-    VulkanError(ash::vk::Result),
-
-    #[cfg(gles)]
-    GLESLoadingError(egl::LoadError<libloading::Error>),
-    #[cfg(gles)]
-    GLESError(egl::Error),
-
+    Platform(PlatformError),
     NoSupportedDeviceFound,
     PlatformNotSupported,
+}
+
+impl From<PlatformError> for NotSupportedError {
+    fn from(error: PlatformError) -> Self {
+        Self::Platform(error)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -143,6 +135,20 @@ pub struct DeviceInformation {
     pub driver_name: String,
     /// Further information about the driver
     pub driver_info: String,
+}
+
+impl Context {
+    pub fn create_surface_configured<
+        I: raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle,
+    >(
+        &self,
+        window: &I,
+        config: SurfaceConfig,
+    ) -> Result<Surface, NotSupportedError> {
+        let mut surface = self.create_surface(window)?;
+        self.reconfigure_surface(&mut surface, config);
+        Ok(surface)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1110,3 +1116,5 @@ pub struct ScissorRect {
     pub w: u32,
     pub h: u32,
 }
+
+pub type Timings = std::collections::HashMap<String, std::time::Duration>;

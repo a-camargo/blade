@@ -41,20 +41,18 @@ struct Example {
     prev_sync_point: Option<gpu::SyncPoint>,
     screen_size: gpu::Extent,
     context: gpu::Context,
+    surface: gpu::Surface,
 }
 
 impl Example {
     fn new(window: &winit::window::Window) -> Self {
         let window_size = window.inner_size();
         let context = unsafe {
-            gpu::Context::init_windowed(
-                window,
-                gpu::ContextDesc {
-                    validation: cfg!(debug_assertions),
-                    capture: false,
-                    overlay: false,
-                },
-            )
+            gpu::Context::init(gpu::ContextDesc {
+                presentation: true,
+                validation: cfg!(debug_assertions),
+                ..Default::default()
+            })
             .unwrap()
         };
         let capabilities = context.capabilities();
@@ -67,6 +65,15 @@ impl Example {
             height: window_size.height,
             depth: 1,
         };
+        let surface_config = gpu::SurfaceConfig {
+            size: screen_size,
+            usage: gpu::TextureUsage::TARGET,
+            transparent: true,
+            ..Default::default()
+        };
+        let surface = context
+            .create_surface_configured(window, surface_config)
+            .unwrap();
 
         let target = context.create_texture(gpu::TextureDesc {
             name: "main",
@@ -87,13 +94,6 @@ impl Example {
             },
         );
 
-        let surface_info = context.resize(gpu::SurfaceConfig {
-            size: screen_size,
-            usage: gpu::TextureUsage::TARGET,
-            transparent: true,
-            ..Default::default()
-        });
-
         let source = std::fs::read_to_string("examples/ray-query/shader.wgsl").unwrap();
         let shader = context.create_shader(gpu::ShaderDesc { source: &source });
         let rt_layout = <ShaderData as gpu::ShaderData>::layout();
@@ -113,7 +113,7 @@ impl Example {
             vertex: shader.at("draw_vs"),
             vertex_fetches: &[],
             fragment: shader.at("draw_fs"),
-            color_targets: &[surface_info.format.into()],
+            color_targets: &[surface.info().format.into()],
             depth_stencil: None,
         });
 
@@ -210,11 +210,11 @@ impl Example {
         });
         command_encoder.start();
         command_encoder.init_texture(target);
-        if let mut pass = command_encoder.acceleration_structure() {
+        if let mut pass = command_encoder.acceleration_structure("BLAS") {
             pass.build_bottom_level(blas, &meshes, scratch_buffer.at(0));
         }
         //Note: separate pass in order to enforce synchronization
-        if let mut pass = command_encoder.acceleration_structure() {
+        if let mut pass = command_encoder.acceleration_structure("TLAS") {
             pass.build_top_level(
                 tlas,
                 &[blas],
@@ -242,6 +242,7 @@ impl Example {
             command_encoder,
             prev_sync_point: None,
             screen_size,
+            surface,
             context,
         }
     }
@@ -259,12 +260,13 @@ impl Example {
         self.context.destroy_compute_pipeline(&mut self.rt_pipeline);
         self.context
             .destroy_render_pipeline(&mut self.draw_pipeline);
+        self.context.destroy_surface(&mut self.surface);
     }
 
     fn render(&mut self) {
         self.command_encoder.start();
 
-        if let mut pass = self.command_encoder.compute() {
+        if let mut pass = self.command_encoder.compute("ray-trace") {
             let groups = self.rt_pipeline.get_dispatch_for(self.screen_size);
             if let mut pc = pass.with(&self.rt_pipeline) {
                 let fov_y = 0.3;
@@ -290,17 +292,20 @@ impl Example {
             }
         }
 
-        let frame = self.context.acquire_frame();
+        let frame = self.surface.acquire_frame();
         self.command_encoder.init_texture(frame.texture());
 
-        if let mut pass = self.command_encoder.render(gpu::RenderTargetSet {
-            colors: &[gpu::RenderTarget {
-                view: frame.texture_view(),
-                init_op: gpu::InitOp::Clear(gpu::TextureColor::TransparentBlack),
-                finish_op: gpu::FinishOp::Store,
-            }],
-            depth_stencil: None,
-        }) {
+        if let mut pass = self.command_encoder.render(
+            "draw",
+            gpu::RenderTargetSet {
+                colors: &[gpu::RenderTarget {
+                    view: frame.texture_view(),
+                    init_op: gpu::InitOp::Clear(gpu::TextureColor::TransparentBlack),
+                    finish_op: gpu::FinishOp::Store,
+                }],
+                depth_stencil: None,
+            },
+        ) {
             if let mut pc = pass.with(&self.draw_pipeline) {
                 pc.bind(
                     0,
@@ -326,11 +331,10 @@ fn main() {
     env_logger::init();
 
     let event_loop = winit::event_loop::EventLoop::new().unwrap();
-    let window = winit::window::WindowBuilder::new()
-        .with_title("blade-ray-query")
-        .with_transparent(true)
-        .build(&event_loop)
-        .unwrap();
+    let window_attributes =
+        winit::window::Window::default_attributes().with_title("blade-ray-query");
+
+    let window = event_loop.create_window(window_attributes).unwrap();
 
     let mut example = Example::new(&window);
 

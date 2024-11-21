@@ -369,6 +369,7 @@ pub struct Engine {
     load_tasks: Vec<choir::RunningTask>,
     gui_painter: blade_egui::GuiPainter,
     asset_hub: blade_render::AssetHub,
+    gpu_surface: gpu::Surface,
     gpu_context: Arc<gpu::Context>,
     environment_map: Option<blade_asset::Handle<blade_render::Texture>>,
     objects: slab::Slab<Object>,
@@ -411,20 +412,22 @@ impl Engine {
         log::info!("Initializing the engine");
 
         let gpu_context = Arc::new(unsafe {
-            gpu::Context::init_windowed(
-                window,
-                gpu::ContextDesc {
-                    validation: cfg!(debug_assertions),
-                    capture: false,
-                    overlay: false,
-                },
-            )
+            gpu::Context::init(gpu::ContextDesc {
+                presentation: true,
+                validation: cfg!(debug_assertions),
+                timing: true,
+                capture: false,
+                overlay: false,
+            })
             .unwrap()
         });
 
         let surface_config = Self::make_surface_config(window.inner_size());
         let surface_size = surface_config.size;
-        let surface_info = gpu_context.resize(surface_config);
+        let gpu_surface = gpu_context
+            .create_surface_configured(window, surface_config)
+            .unwrap();
+        let surface_info = gpu_surface.info();
 
         let num_workers = num_cpus::get_physical().max((num_cpus::get() * 3 + 2) / 4);
         log::info!("Initializing Choir with {} workers", num_workers);
@@ -469,6 +472,7 @@ impl Engine {
             load_tasks: Vec::new(),
             gui_painter,
             asset_hub,
+            gpu_surface,
             gpu_context,
             environment_map: None,
             objects: slab::Slab::new(),
@@ -482,16 +486,7 @@ impl Engine {
                 reset_variance: false,
                 reset_reservoirs: true,
             },
-            ray_config: blade_render::RayConfig {
-                num_environment_samples: 1,
-                environment_importance_sampling: false,
-                temporal_tap: true,
-                temporal_history: 10,
-                spatial_taps: 1,
-                spatial_tap_history: 5,
-                spatial_radius: 10,
-                t_start: 0.01,
-            },
+            ray_config: blade_helpers::default_ray_config(),
             denoiser_enabled: true,
             denoiser_config: blade_render::DenoiserConfig {
                 num_passes: 4,
@@ -514,6 +509,7 @@ impl Engine {
         self.workers.clear();
         self.pacer.destroy(&self.gpu_context);
         self.gui_painter.destroy(&self.gpu_context);
+        self.gpu_context.destroy_surface(&mut self.gpu_surface);
         self.renderer.destroy(&self.gpu_context);
         self.asset_hub.destroy();
     }
@@ -552,7 +548,8 @@ impl Engine {
         if new_render_size != self.renderer.get_surface_size() {
             log::info!("Resizing to {}", new_render_size);
             self.pacer.wait_for_previous_frame(&self.gpu_context);
-            self.gpu_context.resize(surface_config);
+            self.gpu_context
+                .reconfigure_surface(&mut self.gpu_surface, surface_config);
         }
 
         let (command_encoder, temp) = self.pacer.begin_frame();
@@ -605,14 +602,16 @@ impl Engine {
             }
 
             // Rebuilding every frame
-            self.renderer.build_scene(
-                command_encoder,
-                &self.render_objects,
-                self.environment_map,
-                &self.asset_hub,
-                &self.gpu_context,
-                temp,
-            );
+            if !self.frame_config.frozen {
+                self.renderer.build_scene(
+                    command_encoder,
+                    &self.render_objects,
+                    self.environment_map,
+                    &self.asset_hub,
+                    &self.gpu_context,
+                    temp,
+                );
+            }
 
             self.renderer.prepare(
                 command_encoder,
@@ -683,17 +682,20 @@ impl Engine {
             }
         }
 
-        let frame = self.gpu_context.acquire_frame();
+        let frame = self.gpu_surface.acquire_frame();
         command_encoder.init_texture(frame.texture());
 
-        if let mut pass = command_encoder.render(gpu::RenderTargetSet {
-            colors: &[gpu::RenderTarget {
-                view: frame.texture_view(),
-                init_op: gpu::InitOp::Clear(gpu::TextureColor::TransparentBlack),
-                finish_op: gpu::FinishOp::Store,
-            }],
-            depth_stencil: None,
-        }) {
+        if let mut pass = command_encoder.render(
+            "draw",
+            gpu::RenderTargetSet {
+                colors: &[gpu::RenderTarget {
+                    view: frame.texture_view(),
+                    init_op: gpu::InitOp::Clear(gpu::TextureColor::TransparentBlack),
+                    finish_op: gpu::FinishOp::Store,
+                }],
+                depth_stencil: None,
+            },
+        ) {
             let screen_desc = blade_egui::ScreenDescriptor {
                 physical_size: (physical_size.width, physical_size.height),
                 scale_factor,
@@ -765,6 +767,16 @@ impl Engine {
                     self.physics.debug_pipeline.mode.set(flag, enabled);
                 }
             });
+
+        egui::CollapsingHeader::new("Performance").show(ui, |ui| {
+            for (name, time) in self.pacer.timings() {
+                let millis = time.as_secs_f32() * 1000.0;
+                ui.horizontal(|ui| {
+                    ui.label(name);
+                    ui.colored_label(egui::Color32::WHITE, format!("{:.2} ms", millis));
+                });
+            }
+        });
 
         egui::CollapsingHeader::new("Objects")
             .default_open(true)

@@ -16,17 +16,17 @@ base64 = "0.21"
 bitflags = "2"
 bytemuck = { version = "1", features = ["derive"] }
 choir = "0.7"
-egui = "0.28"
-glam = { version = "0.27", features = ["mint"] }
+egui = "0.29"
+glam = { version = "0.28", features = ["mint"] }
 gltf = { version = "1.1", default-features = false }
 log = "0.4"
 mint = "0.5"
-naga = { version = "22", features = ["wgsl-in"] }
+naga = { version = "23.0", features = ["wgsl-in"] }
 profiling = "1"
 slab = "0.4"
 strum = { version = "0.25", features = ["derive"] }
 web-sys = "0.3.60"
-winit = "0.29"
+winit = "0.30"
 
 [lib]
 
@@ -45,7 +45,7 @@ readme = "docs/README.md"
 
 [dependencies]
 blade-asset = { version = "0.2", path = "blade-asset" }
-blade-egui = { version = "0.4", path = "blade-egui" }
+blade-egui = { version = "0.5", path = "blade-egui" }
 blade-graphics = { version = "0.5", path = "blade-graphics" }
 blade-helpers = { version = "0.1", path = "blade-helpers" }
 blade-util = { version = "0.1", path = "blade-util" }
@@ -68,12 +68,11 @@ winit = { workspace = true }
 blade-render = { version = "0.3", path = "blade-render" }
 
 [dev-dependencies]
-egui_plot = "0.28"
 blade-macros = { version = "0.3", path = "blade-macros" }
 bytemuck = { workspace = true }
 choir = { workspace = true }
 egui = { workspace = true }
-transform-gizmo-egui = { git = "https://github.com/urholaukkarinen/transform-gizmo", rev = "5be085444468ff7059abcd4e4872ab4510f65a06" }
+transform-gizmo-egui = { git = "https://github.com/urholaukkarinen/transform-gizmo", rev = "7556fb38b37f3772c57dd0fae6a276976d314f9b" }
 env_logger = "0.11"
 glam = { workspace = true }
 log = { workspace = true }
@@ -89,7 +88,7 @@ del-geo = "=0.1.29"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # see https://github.com/emilk/egui/issues/4270
-egui-winit = "0.28"
+egui-winit = "0.29"
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 console_error_panic_hook = "0.1.7"

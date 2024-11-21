@@ -1,5 +1,5 @@
 use ash::vk;
-use std::str;
+use std::{str, time::Duration};
 
 impl super::CrashHandler {
     fn add_marker(&mut self, marker: &str) -> u32 {
@@ -122,9 +122,9 @@ impl crate::ShaderBindable for super::AccelerationStructure {
 }
 
 impl crate::TexturePiece {
-    fn subresource_layers(&self, aspects: crate::TexelAspects) -> vk::ImageSubresourceLayers {
+    fn subresource_layers(&self) -> vk::ImageSubresourceLayers {
         vk::ImageSubresourceLayers {
-            aspect_mask: super::map_aspects(aspects),
+            aspect_mask: super::map_aspects(self.texture.format.aspects()),
             mip_level: self.mip_level,
             base_array_layer: self.array_layer,
             layer_count: 1,
@@ -152,7 +152,7 @@ fn make_buffer_image_copy(
         buffer_row_length: block_info.dimensions.0 as u32
             * (bytes_per_row / block_info.size as u32),
         buffer_image_height: 0,
-        image_subresource: texture.subresource_layers(texture.texture.format.aspects()),
+        image_subresource: texture.subresource_layers(),
         image_offset: map_origin(&texture.origin),
         image_extent: super::map_extent_3d(size),
     }
@@ -202,8 +202,16 @@ fn map_render_target(rt: &crate::RenderTarget) -> vk::RenderingAttachmentInfo<'s
     vk_info
 }
 
+fn end_pass(device: &super::Device, cmd_buf: vk::CommandBuffer) {
+    if device.command_scope.is_some() {
+        unsafe {
+            device.debug_utils.cmd_end_debug_utils_label(cmd_buf);
+        }
+    }
+}
+
 impl super::CommandEncoder {
-    pub fn mark(&mut self, marker: &str) {
+    fn add_marker(&mut self, marker: &str) {
         if let Some(ref mut ch) = self.crash_handler {
             let id = ch.add_marker(marker);
             unsafe {
@@ -222,29 +230,64 @@ impl super::CommandEncoder {
         }
     }
 
-    pub fn start(&mut self) {
-        self.buffers.rotate_left(1);
-        self.device
-            .reset_descriptor_pool(&mut self.buffers[0].descriptor_pool);
+    fn add_timestamp(&mut self, label: &str) {
+        if let Some(_) = self.device.timing {
+            let cmd_buf = self.buffers.first_mut().unwrap();
+            if cmd_buf.timed_pass_names.len() == crate::limits::PASS_COUNT {
+                log::warn!("Reached the maximum for `limits::PASS_COUNT`, skipping the timer");
+                return;
+            }
+            let index = cmd_buf.timed_pass_names.len() as u32;
+            unsafe {
+                self.device.core.cmd_write_timestamp(
+                    cmd_buf.raw,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    cmd_buf.query_pool,
+                    index,
+                );
+            }
+            cmd_buf.timed_pass_names.push(label.to_string());
+        }
+    }
 
-        let vk_info = vk::CommandBufferBeginInfo {
-            flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
-            ..Default::default()
-        };
-        unsafe {
-            self.device
-                .core
-                .begin_command_buffer(self.buffers[0].raw, &vk_info)
-                .unwrap();
+    fn begin_pass(&mut self, label: &str) {
+        self.barrier();
+        self.add_marker(label);
+        self.add_timestamp(label);
+
+        if let Some(_) = self.device.command_scope {
+            self.temp_label.clear();
+            self.temp_label.extend_from_slice(label.as_bytes());
+            self.temp_label.push(0);
+            unsafe {
+                self.device.debug_utils.cmd_begin_debug_utils_label(
+                    self.buffers[0].raw,
+                    &vk::DebugUtilsLabelEXT {
+                        p_label_name: self.temp_label.as_ptr() as *const _,
+                        ..Default::default()
+                    },
+                )
+            }
         }
     }
 
     pub(super) fn finish(&mut self) -> vk::CommandBuffer {
         self.barrier();
-        self.mark("finish");
-        let raw = self.buffers[0].raw;
-        unsafe { self.device.core.end_command_buffer(raw).unwrap() }
-        raw
+        self.add_marker("finish");
+        let cmd_buf = self.buffers.first_mut().unwrap();
+        unsafe {
+            if self.device.timing.is_some() {
+                let index = cmd_buf.timed_pass_names.len() as u32;
+                self.device.core.cmd_write_timestamp(
+                    cmd_buf.raw,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    cmd_buf.query_pool,
+                    index,
+                );
+            }
+            self.device.core.end_command_buffer(cmd_buf.raw).unwrap();
+        }
+        cmd_buf.raw
     }
 
     fn barrier(&mut self) {
@@ -269,93 +312,27 @@ impl super::CommandEncoder {
         }
     }
 
-    pub fn init_texture(&mut self, texture: super::Texture) {
-        let barrier = vk::ImageMemoryBarrier {
-            old_layout: vk::ImageLayout::UNDEFINED,
-            new_layout: vk::ImageLayout::GENERAL,
-            image: texture.raw,
-            subresource_range: vk::ImageSubresourceRange {
-                aspect_mask: super::map_aspects(texture.format.aspects()),
-                base_mip_level: 0,
-                level_count: vk::REMAINING_MIP_LEVELS,
-                base_array_layer: 0,
-                layer_count: vk::REMAINING_ARRAY_LAYERS,
-            },
-            ..Default::default()
-        };
-        unsafe {
-            self.device.core.cmd_pipeline_barrier(
-                self.buffers[0].raw,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[barrier],
-            );
-        }
-    }
-
-    pub fn present(&mut self, frame: super::Frame) {
-        if frame.acquire_semaphore == vk::Semaphore::null() {
-            return;
-        }
-
-        assert_eq!(self.present, None);
-        let wa = &self.device.workarounds;
-        self.present = Some(super::Presentation {
-            image_index: frame.image_index,
-            acquire_semaphore: frame.acquire_semaphore,
-        });
-
-        let barrier = vk::ImageMemoryBarrier {
-            old_layout: vk::ImageLayout::GENERAL,
-            new_layout: vk::ImageLayout::PRESENT_SRC_KHR,
-            image: frame.image,
-            subresource_range: vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            },
-            src_access_mask: vk::AccessFlags::MEMORY_WRITE | wa.extra_sync_src_access,
-            ..Default::default()
-        };
-        unsafe {
-            self.device.core.cmd_pipeline_barrier(
-                self.buffers[0].raw,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[barrier],
-            );
-        }
-    }
-
-    pub fn transfer(&mut self) -> super::TransferCommandEncoder {
-        self.barrier();
-        self.mark("pass/transfer");
+    pub fn transfer(&mut self, label: &str) -> super::TransferCommandEncoder {
+        self.begin_pass(label);
         super::TransferCommandEncoder {
             raw: self.buffers[0].raw,
             device: &self.device,
         }
     }
 
-    pub fn acceleration_structure(&mut self) -> super::AccelerationStructureCommandEncoder {
-        self.barrier();
-        self.mark("pass/acc-struct");
+    pub fn acceleration_structure(
+        &mut self,
+        label: &str,
+    ) -> super::AccelerationStructureCommandEncoder {
+        self.begin_pass(label);
         super::AccelerationStructureCommandEncoder {
             raw: self.buffers[0].raw,
             device: &self.device,
         }
     }
 
-    pub fn compute(&mut self) -> super::ComputeCommandEncoder {
-        self.barrier();
-        self.mark("pass/compute");
+    pub fn compute(&mut self, label: &str) -> super::ComputeCommandEncoder {
+        self.begin_pass(label);
         super::ComputeCommandEncoder {
             cmd_buf: self.buffers.first_mut().unwrap(),
             device: &self.device,
@@ -363,9 +340,12 @@ impl super::CommandEncoder {
         }
     }
 
-    pub fn render(&mut self, targets: crate::RenderTargetSet) -> super::RenderCommandEncoder {
-        self.barrier();
-        self.mark("pass/render");
+    pub fn render(
+        &mut self,
+        label: &str,
+        targets: crate::RenderTargetSet,
+    ) -> super::RenderCommandEncoder {
+        self.begin_pass(label);
 
         let mut target_size = [0u16; 2];
         let mut color_attachments = Vec::with_capacity(targets.colors.len());
@@ -454,6 +434,137 @@ impl super::CommandEncoder {
 }
 
 #[hidden_trait::expose]
+impl crate::traits::CommandEncoder for super::CommandEncoder {
+    type Texture = super::Texture;
+    type Frame = super::Frame;
+
+    fn start(&mut self) {
+        self.buffers.rotate_left(1);
+        let cmd_buf = self.buffers.first_mut().unwrap();
+        self.device
+            .reset_descriptor_pool(&mut cmd_buf.descriptor_pool);
+
+        let vk_info = vk::CommandBufferBeginInfo {
+            flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+            ..Default::default()
+        };
+        unsafe {
+            self.device
+                .core
+                .begin_command_buffer(cmd_buf.raw, &vk_info)
+                .unwrap();
+        }
+
+        if let Some(ref timing) = self.device.timing {
+            self.timings.clear();
+            if !cmd_buf.timed_pass_names.is_empty() {
+                let mut timestamps = [0u64; super::QUERY_POOL_SIZE];
+                unsafe {
+                    self.device
+                        .core
+                        .get_query_pool_results(
+                            cmd_buf.query_pool,
+                            0,
+                            &mut timestamps[..cmd_buf.timed_pass_names.len() + 1],
+                            vk::QueryResultFlags::TYPE_64,
+                        )
+                        .unwrap();
+                }
+                let mut prev = timestamps[0];
+                for (name, &ts) in cmd_buf
+                    .timed_pass_names
+                    .drain(..)
+                    .zip(timestamps[1..].iter())
+                {
+                    let diff = (ts - prev) as f32 * timing.period;
+                    prev = ts;
+                    *self.timings.entry(name).or_default() += Duration::from_nanos(diff as _);
+                }
+            }
+            unsafe {
+                self.device.core.cmd_reset_query_pool(
+                    cmd_buf.raw,
+                    cmd_buf.query_pool,
+                    0,
+                    super::QUERY_POOL_SIZE as u32,
+                );
+            }
+        }
+    }
+
+    fn init_texture(&mut self, texture: super::Texture) {
+        let barrier = vk::ImageMemoryBarrier {
+            old_layout: vk::ImageLayout::UNDEFINED,
+            new_layout: vk::ImageLayout::GENERAL,
+            image: texture.raw,
+            subresource_range: vk::ImageSubresourceRange {
+                aspect_mask: super::map_aspects(texture.format.aspects()),
+                base_mip_level: 0,
+                level_count: vk::REMAINING_MIP_LEVELS,
+                base_array_layer: 0,
+                layer_count: vk::REMAINING_ARRAY_LAYERS,
+            },
+            ..Default::default()
+        };
+        unsafe {
+            self.device.core.cmd_pipeline_barrier(
+                self.buffers[0].raw,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+        }
+    }
+
+    fn present(&mut self, frame: super::Frame) {
+        if frame.internal.acquire_semaphore == vk::Semaphore::null() {
+            return;
+        }
+
+        assert_eq!(self.present, None);
+        let wa = &self.device.workarounds;
+        self.present = Some(super::Presentation {
+            acquire_semaphore: frame.internal.acquire_semaphore,
+            swapchain: frame.swapchain.raw,
+            image_index: frame.image_index,
+        });
+
+        let barrier = vk::ImageMemoryBarrier {
+            old_layout: vk::ImageLayout::GENERAL,
+            new_layout: vk::ImageLayout::PRESENT_SRC_KHR,
+            image: frame.internal.image,
+            subresource_range: vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            src_access_mask: vk::AccessFlags::MEMORY_WRITE | wa.extra_sync_src_access,
+            ..Default::default()
+        };
+        unsafe {
+            self.device.core.cmd_pipeline_barrier(
+                self.buffers[0].raw,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+        }
+    }
+
+    fn timings(&self) -> &crate::Timings {
+        &self.timings
+    }
+}
+
+#[hidden_trait::expose]
 impl crate::traits::TransferEncoder for super::TransferCommandEncoder<'_> {
     type BufferPiece = crate::BufferPiece;
     type TexturePiece = crate::TexturePiece;
@@ -492,9 +603,9 @@ impl crate::traits::TransferEncoder for super::TransferCommandEncoder<'_> {
         size: crate::Extent,
     ) {
         let copy = vk::ImageCopy {
-            src_subresource: src.subresource_layers(crate::TexelAspects::all()),
+            src_subresource: src.subresource_layers(),
             src_offset: map_origin(&src.origin),
-            dst_subresource: dst.subresource_layers(crate::TexelAspects::all()),
+            dst_subresource: dst.subresource_layers(),
             dst_offset: map_origin(&dst.origin),
             extent: super::map_extent_3d(&size),
         };
@@ -546,6 +657,12 @@ impl crate::traits::TransferEncoder for super::TransferCommandEncoder<'_> {
                 &[copy],
             )
         };
+    }
+}
+
+impl Drop for super::TransferCommandEncoder<'_> {
+    fn drop(&mut self) {
+        end_pass(self.device, self.raw);
     }
 }
 
@@ -633,6 +750,12 @@ impl crate::traits::AccelerationStructureEncoder
     }
 }
 
+impl Drop for super::AccelerationStructureCommandEncoder<'_> {
+    fn drop(&mut self) {
+        end_pass(self.device, self.raw);
+    }
+}
+
 impl<'a> super::ComputeCommandEncoder<'a> {
     pub fn with<'b, 'p>(
         &'b mut self,
@@ -646,6 +769,12 @@ impl<'a> super::ComputeCommandEncoder<'a> {
             update_data: self.update_data,
         }
         .init(pipeline.raw)
+    }
+}
+
+impl Drop for super::ComputeCommandEncoder<'_> {
+    fn drop(&mut self) {
+        end_pass(self.device, self.cmd_buf.raw);
     }
 }
 
@@ -690,6 +819,7 @@ impl Drop for super::RenderCommandEncoder<'_> {
                 .dynamic_rendering
                 .cmd_end_rendering(self.cmd_buf.raw)
         };
+        end_pass(self.device, self.cmd_buf.raw);
     }
 }
 
