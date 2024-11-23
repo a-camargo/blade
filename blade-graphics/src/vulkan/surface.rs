@@ -92,13 +92,20 @@ impl super::Context {
             return Err(crate::NotSupportedError::PlatformNotSupported);
         }
 
-        let surface_info = vk::PhysicalDeviceSurfaceInfo2KHR {
+        let mut surface_info = vk::PhysicalDeviceSurfaceInfo2KHR {
             surface: raw,
             ..Default::default()
         };
         let mut fullscreen_exclusive_ext = vk::SurfaceCapabilitiesFullScreenExclusiveEXT::default();
         let mut capabilities2_khr =
             vk::SurfaceCapabilities2KHR::default().push_next(&mut fullscreen_exclusive_ext);
+        let mut win32fullscreen = 
+            vk::SurfaceFullScreenExclusiveWin32InfoEXT::default();
+
+        if cfg!(windows) {
+            surface_info = surface_info.push_next(&mut win32fullscreen);
+        }
+
         let _ = unsafe {
             self.instance
                 .get_surface_capabilities2
