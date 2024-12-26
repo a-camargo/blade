@@ -15,7 +15,6 @@
     clippy::missing_safety_doc,
 )]
 #![warn(
-    trivial_casts,
     trivial_numeric_casts,
     unused_extern_crates,
     //TODO: re-enable. Currently doesn't like "mem::size_of" on newer Rust
@@ -69,7 +68,7 @@ pub mod derive;
 #[cfg_attr(any(gles, target_arch = "wasm32"), path = "gles/mod.rs")]
 mod hal;
 mod shader;
-mod traits;
+pub mod traits;
 pub mod util;
 pub mod limits {
     /// Max number of passes inside a command encoder.
@@ -104,6 +103,8 @@ pub struct ContextDesc {
     pub capture: bool,
     /// Enable GAPI overlay.
     pub overlay: bool,
+    /// Force selection of a specific Device ID, unless 0.
+    pub device_id: u32,
 }
 
 #[derive(Debug)]
@@ -285,6 +286,7 @@ pub enum TextureFormat {
     Bgra8UnormSrgb,
     Rgba8Snorm,
     R16Float,
+    Rg16Float,
     Rgba16Float,
     R32Float,
     Rg32Float,
@@ -308,6 +310,14 @@ pub enum TextureFormat {
     Bc4Snorm,
     Bc5Unorm,
     Bc5Snorm,
+    Bc6hUfloat,
+    Bc6hFloat,
+    Bc7Unorm,
+    Bc7UnormSrgb,
+    // packed 32-bit
+    Rgb10a2Unorm,
+    Rg11b10Ufloat,
+    Rgb9e5Ufloat,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -403,6 +413,7 @@ pub struct TextureDesc<'a> {
     pub size: Extent,
     pub array_layer_count: u32,
     pub mip_level_count: u32,
+    pub sample_count: u32,
     pub dimension: TextureDimension,
     pub usage: TextureUsage,
 }
@@ -1022,20 +1033,41 @@ pub struct RenderPipelineDesc<'a> {
     pub vertex_fetches: &'a [VertexFetchState<'a>],
     pub primitive: PrimitiveState,
     pub depth_stencil: Option<DepthStencilState>,
-    pub fragment: ShaderFunction<'a>,
+    pub fragment: Option<ShaderFunction<'a>>,
     pub color_targets: &'a [ColorTargetState],
+    pub multisample_state: MultisampleState,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MultisampleState {
+    pub sample_count: u32,
+    pub sample_mask: u64,
+    pub alpha_to_coverage: bool,
+}
+
+impl Default for MultisampleState {
+    fn default() -> Self {
+        Self {
+            sample_count: 1,
+            sample_mask: !0,
+            alpha_to_coverage: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
 pub enum InitOp {
     Load,
     Clear(TextureColor),
+    DontCare,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub enum FinishOp {
     Store,
     Discard,
+    /// The texture specified here will be stored but it is undefined what
+    /// happens to the original render target
     ResolveTo(TextureView),
     Ignore,
 }
@@ -1117,4 +1149,13 @@ pub struct ScissorRect {
     pub h: u32,
 }
 
-pub type Timings = std::collections::HashMap<String, std::time::Duration>;
+#[derive(Clone, Debug, PartialEq)]
+pub struct Viewport {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub depth: std::ops::Range<f32>,
+}
+
+pub type Timings = Vec<(String, std::time::Duration)>;

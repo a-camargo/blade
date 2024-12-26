@@ -16,6 +16,6 @@ proc-macro2 = "1"
 quote = "1.0"
 
 [dev-dependencies]
-blade-graphics = { version = "0.5", path = "../blade-graphics" }
+blade-graphics = { version = "0.6", path = "../blade-graphics" }
 bytemuck = { workspace = true }
 mint = { workspace = true }

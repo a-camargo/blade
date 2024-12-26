@@ -164,8 +164,18 @@ impl super::Context {
         info: &crate::ShaderDataInfo,
     ) -> super::DescriptorSetLayout {
         if info.visibility.is_empty() {
-            return super::DescriptorSetLayout::default();
+            // we need to have a valid `VkDescriptorSetLayout` regardless
+            return super::DescriptorSetLayout {
+                raw: unsafe {
+                    self.device
+                        .core
+                        .create_descriptor_set_layout(&Default::default(), None)
+                        .unwrap()
+                },
+                ..Default::default()
+            };
         }
+
         let stage_flags = map_shader_visibility(info.visibility);
         let mut vk_bindings = Vec::with_capacity(layout.bindings.len());
         let mut template_entries = Vec::with_capacity(layout.bindings.len());
@@ -230,6 +240,7 @@ impl super::Context {
                     vk::DescriptorBindingFlags::empty(),
                 ),
             };
+
             vk_bindings.push(vk::DescriptorSetLayoutBinding {
                 binding: binding_index as u32,
                 descriptor_type,
@@ -245,8 +256,8 @@ impl super::Context {
                 offset: update_offset,
                 stride: descriptor_size,
             });
-            template_offsets.push(update_offset as u32);
             binding_flags.push(flag);
+            template_offsets.push(update_offset as u32);
             update_offset += descriptor_size * descriptor_count as usize;
         }
 
@@ -310,16 +321,22 @@ impl super::Context {
 
     fn destroy_pipeline_layout(&self, layout: &mut super::PipelineLayout) {
         unsafe {
-            self.device.core.destroy_pipeline_layout(layout.raw, None);
+            self.device
+                .core
+                .destroy_pipeline_layout(mem::take(&mut layout.raw), None);
         }
         for dsl in layout.descriptor_set_layouts.drain(..) {
             unsafe {
                 self.device
                     .core
                     .destroy_descriptor_set_layout(dsl.raw, None);
-                self.device
-                    .core
-                    .destroy_descriptor_update_template(dsl.update_template, None);
+            }
+            if !dsl.is_empty() {
+                unsafe {
+                    self.device
+                        .core
+                        .destroy_descriptor_update_template(dsl.update_template, None);
+                }
             }
         }
     }
@@ -408,15 +425,24 @@ impl crate::traits::ShaderDevice for super::Context {
             &mut group_infos,
             desc.vertex_fetches,
         );
-        let fs = self.load_shader(
-            desc.fragment,
-            &options,
-            desc.data_layouts,
-            &mut group_infos,
-            &[],
-        );
+        let fs = desc.fragment.map(|desc_fragment| {
+            self.load_shader(
+                desc_fragment,
+                &options,
+                desc.data_layouts,
+                &mut group_infos,
+                &[],
+            )
+        });
 
-        let stages = [vs.create_info, fs.create_info];
+        let mut stages = [vs.create_info, vk::PipelineShaderStageCreateInfo::default()];
+        let mut stage_count = 1;
+        if let Some(ref fs) = fs {
+            stages[1] = fs.create_info;
+            stage_count += 1;
+        }
+        let stages = &stages[..stage_count]; // 'dynamic' stack allocated array
+
         let layout = self.create_pipeline_layout(desc.data_layouts, &group_infos);
 
         let vertex_buffers = desc
@@ -486,15 +512,29 @@ impl crate::traits::ShaderDevice for super::Context {
             .scissor_count(1)
             .viewport_count(1);
 
-        let vk_sample_mask = [1u32, 0];
+        let vk_sample_mask = [
+            desc.multisample_state.sample_mask as u32,
+            (desc.multisample_state.sample_mask >> 32) as u32,
+        ];
+
         let vk_multisample = vk::PipelineMultisampleStateCreateInfo::default()
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1)
+            .rasterization_samples(vk::SampleCountFlags::from_raw(
+                desc.multisample_state.sample_count,
+            ))
+            .alpha_to_coverage_enable(desc.multisample_state.alpha_to_coverage)
             .sample_mask(&vk_sample_mask);
 
-        let mut ds_format = vk::Format::UNDEFINED;
+        let mut d_format = vk::Format::UNDEFINED;
+        let mut s_format = vk::Format::UNDEFINED;
         let mut vk_depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default();
         if let Some(ref ds) = desc.depth_stencil {
-            ds_format = super::map_texture_format(ds.format);
+            let ds_format = super::map_texture_format(ds.format);
+            if ds.format.aspects().contains(crate::TexelAspects::DEPTH) {
+                d_format = ds_format;
+            }
+            if ds.format.aspects().contains(crate::TexelAspects::STENCIL) {
+                s_format = ds_format;
+            }
 
             if ds.depth_write_enabled || ds.depth_compare != crate::CompareFunction::Always {
                 vk_depth_stencil = vk_depth_stencil
@@ -547,8 +587,8 @@ impl crate::traits::ShaderDevice for super::Context {
 
         let mut rendering_info = vk::PipelineRenderingCreateInfo::default()
             .color_attachment_formats(&color_formats)
-            .depth_attachment_format(ds_format)
-            .stencil_attachment_format(ds_format);
+            .depth_attachment_format(d_format)
+            .stencil_attachment_format(s_format);
 
         let create_info = vk::GraphicsPipelineCreateInfo::default()
             .layout(layout.raw)
@@ -572,7 +612,9 @@ impl crate::traits::ShaderDevice for super::Context {
         let raw = raw_vec.pop().unwrap();
 
         unsafe { self.device.core.destroy_shader_module(vs.vk_module, None) };
-        unsafe { self.device.core.destroy_shader_module(fs.vk_module, None) };
+        if let Some(fs) = fs {
+            unsafe { self.device.core.destroy_shader_module(fs.vk_module, None) };
+        }
 
         if !desc.name.is_empty() {
             self.set_object_name(raw, desc.name);

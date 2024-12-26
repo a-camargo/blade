@@ -32,13 +32,13 @@ struct Uniforms {
 #[derive(blade_macros::ShaderData)]
 struct Globals {
     r_uniforms: Uniforms,
-    r_sampler: blade_graphics::Sampler,
 }
 
 #[derive(blade_macros::ShaderData)]
 struct Locals {
     r_vertex_data: blade_graphics::BufferPiece,
     r_texture: blade_graphics::TextureView,
+    r_sampler: blade_graphics::Sampler,
 }
 
 #[derive(Debug, PartialEq)]
@@ -58,11 +58,25 @@ impl ScreenDescriptor {
 struct GuiTexture {
     allocation: blade_graphics::Texture,
     view: blade_graphics::TextureView,
+    sampler: blade_graphics::Sampler,
+}
+
+#[inline]
+const fn egui_texture_filter_to_blade(filter: egui::TextureFilter) -> blade_graphics::FilterMode {
+    match filter {
+        egui::TextureFilter::Nearest => blade_graphics::FilterMode::Nearest,
+        egui::TextureFilter::Linear => blade_graphics::FilterMode::Linear,
+    }
 }
 
 impl GuiTexture {
-    fn create(context: &blade_graphics::Context, name: &str, size: blade_graphics::Extent) -> Self {
-        let format = blade_graphics::TextureFormat::Rgba8UnormSrgb;
+    fn create(
+        context: &blade_graphics::Context,
+        name: &str,
+        size: blade_graphics::Extent,
+        options: egui::TextureOptions,
+    ) -> Self {
+        let format = blade_graphics::TextureFormat::Rgba8Unorm;
         let allocation = context.create_texture(blade_graphics::TextureDesc {
             name,
             format,
@@ -71,6 +85,7 @@ impl GuiTexture {
             mip_level_count: 1,
             dimension: blade_graphics::TextureDimension::D2,
             usage: blade_graphics::TextureUsage::COPY | blade_graphics::TextureUsage::RESOURCE,
+            sample_count: 1,
         });
         let view = context.create_texture_view(
             allocation,
@@ -81,12 +96,38 @@ impl GuiTexture {
                 subresources: &blade_graphics::TextureSubresources::default(),
             },
         );
-        Self { allocation, view }
+        let sampler = context.create_sampler(blade_graphics::SamplerDesc {
+            name,
+            address_modes: {
+                let mode = match options.wrap_mode {
+                    egui::TextureWrapMode::ClampToEdge => blade_graphics::AddressMode::ClampToEdge,
+                    egui::TextureWrapMode::Repeat => blade_graphics::AddressMode::Repeat,
+                    egui::TextureWrapMode::MirroredRepeat => {
+                        blade_graphics::AddressMode::MirrorRepeat
+                    }
+                };
+                [mode; 3]
+            },
+            mag_filter: egui_texture_filter_to_blade(options.magnification),
+            min_filter: egui_texture_filter_to_blade(options.minification),
+            mipmap_filter: options
+                .mipmap_mode
+                .map(egui_texture_filter_to_blade)
+                .unwrap_or_default(),
+
+            ..Default::default()
+        });
+        Self {
+            allocation,
+            view,
+            sampler,
+        }
     }
 
     fn delete(self, context: &blade_graphics::Context) {
         context.destroy_texture(self.allocation);
         context.destroy_texture_view(self.view);
+        context.destroy_sampler(self.sampler);
     }
 }
 
@@ -103,7 +144,6 @@ pub struct GuiPainter {
     //TODO: this could also look better
     textures_dropped: Vec<GuiTexture>,
     textures_to_delete: Vec<(GuiTexture, blade_graphics::SyncPoint)>,
-    sampler: blade_graphics::Sampler,
 }
 
 impl GuiPainter {
@@ -120,7 +160,6 @@ impl GuiPainter {
         for (gui_texture, _) in self.textures_to_delete.drain(..) {
             gui_texture.delete(context);
         }
-        context.destroy_sampler(self.sampler);
     }
 
     /// Create a new painter with a given GPU context.
@@ -144,12 +183,24 @@ impl GuiPainter {
                 ..Default::default()
             },
             depth_stencil: None, //TODO?
-            fragment: shader.at("fs_main"),
+            fragment: Some(shader.at("fs_main")),
             color_targets: &[blade_graphics::ColorTargetState {
                 format: info.format,
-                blend: Some(blade_graphics::BlendState::ALPHA_BLENDING),
+                blend: Some(blade_graphics::BlendState {
+                    color: blade_graphics::BlendComponent {
+                        src_factor: blade_graphics::BlendFactor::One,
+                        dst_factor: blade_graphics::BlendFactor::OneMinusSrcAlpha,
+                        operation: blade_graphics::BlendOperation::Add,
+                    },
+                    alpha: blade_graphics::BlendComponent {
+                        src_factor: blade_graphics::BlendFactor::OneMinusDstAlpha,
+                        dst_factor: blade_graphics::BlendFactor::One,
+                        operation: blade_graphics::BlendOperation::Add,
+                    },
+                }),
                 write_mask: blade_graphics::ColorWrites::all(),
             }],
+            multisample_state: Default::default(),
         });
 
         let belt = BufferBelt::new(BufferBeltDescriptor {
@@ -158,21 +209,12 @@ impl GuiPainter {
             alignment: 4,
         });
 
-        let sampler = context.create_sampler(blade_graphics::SamplerDesc {
-            name: "gui",
-            address_modes: [blade_graphics::AddressMode::ClampToEdge; 3],
-            mag_filter: blade_graphics::FilterMode::Linear,
-            min_filter: blade_graphics::FilterMode::Linear,
-            ..Default::default()
-        });
-
         Self {
             pipeline,
             belt,
             textures: Default::default(),
             textures_dropped: Vec::new(),
             textures_to_delete: Vec::new(),
-            sampler,
         }
     }
 
@@ -239,7 +281,8 @@ impl GuiPainter {
             let texture = match self.textures.entry(texture_id) {
                 Entry::Occupied(mut o) => {
                     if image_delta.pos.is_none() {
-                        let texture = GuiTexture::create(context, &label, extent);
+                        let texture =
+                            GuiTexture::create(context, &label, extent, image_delta.options);
                         command_encoder.init_texture(texture.allocation);
                         let old = o.insert(texture);
                         self.textures_dropped.push(old);
@@ -247,7 +290,7 @@ impl GuiPainter {
                     o.into_mut()
                 }
                 Entry::Vacant(v) => {
-                    let texture = GuiTexture::create(context, &label, extent);
+                    let texture = GuiTexture::create(context, &label, extent, image_delta.options);
                     command_encoder.init_texture(texture.allocation);
                     v.insert(texture)
                 }
@@ -298,7 +341,6 @@ impl GuiPainter {
                     screen_size: [logical_size.0, logical_size.1],
                     padding: [0.0; 2],
                 },
-                r_sampler: self.sampler,
             },
         );
 
@@ -340,6 +382,7 @@ impl GuiPainter {
                     &Locals {
                         r_vertex_data: vertex_buf,
                         r_texture: texture.view,
+                        r_sampler: texture.sampler,
                     },
                 );
 

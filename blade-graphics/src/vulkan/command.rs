@@ -195,9 +195,33 @@ fn map_render_target(rt: &crate::RenderTarget) -> vk::RenderingAttachmentInfo<'s
                 },
             }
         };
+
         vk_info.load_op = vk::AttachmentLoadOp::CLEAR;
         vk_info.clear_value = cv;
     }
+
+    if let crate::FinishOp::ResolveTo(resolve_view) = rt.finish_op {
+        vk_info = vk_info
+            .resolve_image_view(resolve_view.raw)
+            .resolve_image_layout(vk::ImageLayout::GENERAL)
+            .resolve_mode(vk::ResolveModeFlags::AVERAGE);
+    }
+
+    vk_info.store_op = match rt.finish_op {
+        crate::FinishOp::Store => vk::AttachmentStoreOp::STORE,
+        crate::FinishOp::Discard => vk::AttachmentStoreOp::DONT_CARE,
+        crate::FinishOp::Ignore => vk::AttachmentStoreOp::DONT_CARE,
+        crate::FinishOp::ResolveTo(..) => {
+            /*
+                TODO: DONT_CARE is most optimal in many cases where the msaa texture itself is never read afterwards but only the resolved,
+                      but how can the user specify this in blade?
+                      https://docs.vulkan.org/samples/latest/samples/performance/msaa/README.html#_best_practice_summary
+            */
+
+            // vk::AttachmentStoreOp::STORE
+            vk::AttachmentStoreOp::DONT_CARE
+        }
+    };
 
     vk_info
 }
@@ -478,7 +502,7 @@ impl crate::traits::CommandEncoder for super::CommandEncoder {
                 {
                     let diff = (ts - prev) as f32 * timing.period;
                     prev = ts;
-                    *self.timings.entry(name).or_default() += Duration::from_nanos(diff as _);
+                    self.timings.push((name, Duration::from_nanos(diff as _)));
                 }
             }
             unsafe {
@@ -520,16 +544,20 @@ impl crate::traits::CommandEncoder for super::CommandEncoder {
     }
 
     fn present(&mut self, frame: super::Frame) {
-        if frame.internal.acquire_semaphore == vk::Semaphore::null() {
-            return;
-        }
+        let image_index = match frame.image_index {
+            Some(index) => index,
+            None => {
+                //Note: image was out of date, we can't present it
+                return;
+            }
+        };
 
         assert_eq!(self.present, None);
         let wa = &self.device.workarounds;
         self.present = Some(super::Presentation {
             acquire_semaphore: frame.internal.acquire_semaphore,
             swapchain: frame.swapchain.raw,
-            image_index: frame.image_index,
+            image_index,
         });
 
         let barrier = vk::ImageMemoryBarrier {
@@ -761,14 +789,19 @@ impl<'a> super::ComputeCommandEncoder<'a> {
         &'b mut self,
         pipeline: &'p super::ComputePipeline,
     ) -> super::PipelineEncoder<'b, 'p> {
+        let bind_point = vk::PipelineBindPoint::COMPUTE;
+        unsafe {
+            self.device
+                .core
+                .cmd_bind_pipeline(self.cmd_buf.raw, bind_point, pipeline.raw)
+        };
         super::PipelineEncoder {
             cmd_buf: self.cmd_buf,
             layout: &pipeline.layout,
-            bind_point: vk::PipelineBindPoint::COMPUTE,
+            bind_point,
             device: self.device,
             update_data: self.update_data,
         }
-        .init(pipeline.raw)
     }
 }
 
@@ -779,36 +812,23 @@ impl Drop for super::ComputeCommandEncoder<'_> {
 }
 
 impl<'a> super::RenderCommandEncoder<'a> {
-    pub fn set_scissor_rect(&mut self, rect: &crate::ScissorRect) {
-        let vk_scissor = vk::Rect2D {
-            offset: vk::Offset2D {
-                x: rect.x,
-                y: rect.y,
-            },
-            extent: vk::Extent2D {
-                width: rect.w,
-                height: rect.h,
-            },
-        };
-        unsafe {
-            self.device
-                .core
-                .cmd_set_scissor(self.cmd_buf.raw, 0, &[vk_scissor])
-        };
-    }
-
     pub fn with<'b, 'p>(
         &'b mut self,
         pipeline: &'p super::RenderPipeline,
     ) -> super::PipelineEncoder<'b, 'p> {
+        let bind_point = vk::PipelineBindPoint::GRAPHICS;
+        unsafe {
+            self.device
+                .core
+                .cmd_bind_pipeline(self.cmd_buf.raw, bind_point, pipeline.raw)
+        };
         super::PipelineEncoder {
             cmd_buf: self.cmd_buf,
             layout: &pipeline.layout,
-            bind_point: vk::PipelineBindPoint::GRAPHICS,
+            bind_point,
             device: self.device,
             update_data: self.update_data,
         }
-        .init(pipeline.raw)
     }
 }
 
@@ -823,14 +843,52 @@ impl Drop for super::RenderCommandEncoder<'_> {
     }
 }
 
-impl super::PipelineEncoder<'_, '_> {
-    fn init(self, raw_pipeline: vk::Pipeline) -> Self {
+impl crate::ScissorRect {
+    const fn to_vk(&self) -> vk::Rect2D {
+        vk::Rect2D {
+            offset: vk::Offset2D {
+                x: self.x,
+                y: self.y,
+            },
+            extent: vk::Extent2D {
+                width: self.w,
+                height: self.h,
+            },
+        }
+    }
+}
+
+impl crate::Viewport {
+    fn to_vk(&self) -> vk::Viewport {
+        vk::Viewport {
+            x: self.x,
+            y: self.y,
+            width: self.w,
+            height: -self.h, // flip Y
+            min_depth: self.depth.start,
+            max_depth: self.depth.end,
+        }
+    }
+}
+
+#[hidden_trait::expose]
+impl crate::traits::RenderEncoder for super::RenderCommandEncoder<'_> {
+    fn set_scissor_rect(&mut self, rect: &crate::ScissorRect) {
+        let vk_scissor = rect.to_vk();
         unsafe {
             self.device
                 .core
-                .cmd_bind_pipeline(self.cmd_buf.raw, self.bind_point, raw_pipeline)
+                .cmd_set_scissor(self.cmd_buf.raw, 0, &[vk_scissor])
         };
-        self
+    }
+
+    fn set_viewport(&mut self, viewport: &crate::Viewport) {
+        let vk_viewport = viewport.to_vk();
+        unsafe {
+            self.device
+                .core
+                .cmd_set_viewport(self.cmd_buf.raw, 0, &[vk_viewport])
+        };
     }
 }
 
@@ -838,22 +896,26 @@ impl super::PipelineEncoder<'_, '_> {
 impl crate::traits::PipelineEncoder for super::PipelineEncoder<'_, '_> {
     fn bind<D: crate::ShaderData>(&mut self, group: u32, data: &D) {
         let dsl = &self.layout.descriptor_set_layouts[group as usize];
-        self.update_data.clear();
-        self.update_data.resize(dsl.template_size as usize, 0);
-        data.fill(super::PipelineContext {
-            update_data: self.update_data.as_mut_slice(),
-            template_offsets: &dsl.template_offsets,
-        });
+        if !dsl.is_empty() {
+            self.update_data.clear();
+            self.update_data.resize(dsl.template_size as usize, 0);
+            data.fill(super::PipelineContext {
+                update_data: self.update_data.as_mut_slice(),
+                template_offsets: &dsl.template_offsets,
+            });
+        }
 
         let vk_set = self
             .device
             .allocate_descriptor_set(&mut self.cmd_buf.descriptor_pool, dsl);
         unsafe {
-            self.device.core.update_descriptor_set_with_template(
-                vk_set,
-                dsl.update_template,
-                self.update_data.as_ptr() as *const _,
-            );
+            if !dsl.is_empty() {
+                self.device.core.update_descriptor_set_with_template(
+                    vk_set,
+                    dsl.update_template,
+                    self.update_data.as_ptr() as *const _,
+                );
+            }
             self.device.core.cmd_bind_descriptor_sets(
                 self.cmd_buf.raw,
                 self.bind_point,
@@ -878,26 +940,29 @@ impl crate::traits::ComputePipelineEncoder for super::PipelineEncoder<'_, '_> {
 }
 
 #[hidden_trait::expose]
-impl crate::traits::RenderPipelineEncoder for super::PipelineEncoder<'_, '_> {
-    type BufferPiece = crate::BufferPiece;
-
+impl crate::traits::RenderEncoder for super::PipelineEncoder<'_, '_> {
     fn set_scissor_rect(&mut self, rect: &crate::ScissorRect) {
-        let vk_scissor = vk::Rect2D {
-            offset: vk::Offset2D {
-                x: rect.x,
-                y: rect.y,
-            },
-            extent: vk::Extent2D {
-                width: rect.w,
-                height: rect.h,
-            },
-        };
+        let vk_scissor = rect.to_vk();
         unsafe {
             self.device
                 .core
                 .cmd_set_scissor(self.cmd_buf.raw, 0, &[vk_scissor])
         };
     }
+
+    fn set_viewport(&mut self, viewport: &crate::Viewport) {
+        let vk_viewport = viewport.to_vk();
+        unsafe {
+            self.device
+                .core
+                .cmd_set_viewport(self.cmd_buf.raw, 0, &[vk_viewport])
+        };
+    }
+}
+
+#[hidden_trait::expose]
+impl crate::traits::RenderPipelineEncoder for super::PipelineEncoder<'_, '_> {
+    type BufferPiece = crate::BufferPiece;
 
     fn bind_vertex(&mut self, index: u32, vertex_buf: crate::BufferPiece) {
         unsafe {

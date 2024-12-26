@@ -89,12 +89,13 @@ fn create_draw_pipeline(
             ..Default::default()
         },
         depth_stencil: None,
-        fragment: shader.at("debug_fs"),
+        fragment: Some(shader.at("debug_fs")),
         color_targets: &[blade_graphics::ColorTargetState {
             format,
             blend: Some(blade_graphics::BlendState::ALPHA_BLENDING),
             write_mask: blade_graphics::ColorWrites::all(),
         }],
+        multisample_state: blade_graphics::MultisampleState::default(),
     })
 }
 
@@ -115,8 +116,9 @@ fn create_blit_pipeline(
             ..Default::default()
         },
         depth_stencil: None,
-        fragment: shader.at("blit_fs"),
+        fragment: Some(shader.at("blit_fs")),
         color_targets: &[format.into()],
+        multisample_state: blade_graphics::MultisampleState::default(),
     })
 }
 

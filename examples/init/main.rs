@@ -29,6 +29,7 @@ impl EnvMapSampler {
             mip_level_count: 1,
             dimension: gpu::TextureDimension::D2,
             usage: gpu::TextureUsage::TARGET,
+            sample_count: 1,
         });
         let accum_view = context.create_texture_view(
             accum_texture,
@@ -46,7 +47,7 @@ impl EnvMapSampler {
             data_layouts: &[&layout],
             vertex: shader.at("vs_init"),
             vertex_fetches: &[],
-            fragment: shader.at("fs_init"),
+            fragment: Some(shader.at("fs_init")),
             primitive: gpu::PrimitiveState {
                 topology: gpu::PrimitiveTopology::TriangleStrip,
                 ..Default::default()
@@ -57,13 +58,14 @@ impl EnvMapSampler {
                 blend: None,
                 write_mask: gpu::ColorWrites::ALL,
             }],
+            multisample_state: gpu::MultisampleState::default(),
         });
         let accum_pipeline = context.create_render_pipeline(gpu::RenderPipelineDesc {
             name: "env-accum",
             data_layouts: &[&layout],
             vertex: shader.at("vs_accum"),
             vertex_fetches: &[],
-            fragment: shader.at("fs_accum"),
+            fragment: Some(shader.at("fs_accum")),
             primitive: gpu::PrimitiveState {
                 topology: gpu::PrimitiveTopology::PointList,
                 ..Default::default()
@@ -74,6 +76,7 @@ impl EnvMapSampler {
                 blend: Some(gpu::BlendState::ADDITIVE),
                 write_mask: gpu::ColorWrites::RED,
             }],
+            multisample_state: gpu::MultisampleState::default(),
         });
 
         Self {

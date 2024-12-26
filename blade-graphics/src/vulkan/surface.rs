@@ -36,15 +36,15 @@ impl super::Surface {
                 super::Frame {
                     internal: self.frames[index as usize],
                     swapchain: self.swapchain,
-                    image_index: index,
+                    image_index: Some(index),
                 }
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 log::warn!("Acquire failed because the surface is out of date");
                 super::Frame {
-                    internal: super::InternalFrame::default(),
+                    internal: self.frames[0],
                     swapchain: self.swapchain,
-                    image_index: 0,
+                    image_index: None,
                 }
             }
             Err(other) => panic!("Aquire image error {}", other),
@@ -96,6 +96,8 @@ impl super::Context {
             surface: raw,
             ..Default::default()
         };
+        let mut fullscreen_exclusive_win32 = vk::SurfaceFullScreenExclusiveWin32InfoEXT::default();
+        surface_info = surface_info.push_next(&mut fullscreen_exclusive_win32);
         let mut fullscreen_exclusive_ext = vk::SurfaceCapabilitiesFullScreenExclusiveEXT::default();
         let mut capabilities2_khr =
             vk::SurfaceCapabilities2KHR::default().push_next(&mut fullscreen_exclusive_ext);
