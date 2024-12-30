@@ -394,21 +394,21 @@ impl super::CommandEncoder {
             }
         }
 
-        let render_area = vk::Rect2D {
-            offset: Default::default(),
-            extent: vk::Extent2D {
-                width: target_size[0] as u32,
-                height: target_size[1] as u32,
-            },
-        };
-        let viewport = vk::Viewport {
+        let render_area = crate::ScissorRect {
+            x: 0,
+            y: 0,
+            w: target_size[0] as u32,
+            h: target_size[1] as u32,
+        }
+        .to_vk();
+        let viewport = crate::Viewport {
             x: 0.0,
-            y: target_size[1] as f32,
-            width: target_size[0] as f32,
-            height: -(target_size[1] as f32),
-            min_depth: 0.0,
-            max_depth: 1.0,
-        };
+            y: 0.0,
+            w: target_size[0] as f32,
+            h: target_size[1] as f32,
+            depth: 0.0..1.0,
+        }
+        .to_vk();
         rendering_info.render_area = render_area;
 
         let cmd_buf = self.buffers.first_mut().unwrap();
@@ -862,7 +862,7 @@ impl crate::Viewport {
     fn to_vk(&self) -> vk::Viewport {
         vk::Viewport {
             x: self.x,
-            y: self.y,
+            y: self.y + self.h, // shift since always flipped y and vulkan >= 1.1
             width: self.w,
             height: -self.h, // flip Y
             min_depth: self.depth.start,
