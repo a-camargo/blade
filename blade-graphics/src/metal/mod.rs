@@ -40,6 +40,7 @@ impl Frame {
     pub fn texture_view(&self) -> TextureView {
         TextureView {
             raw: Retained::as_ptr(&self.texture) as *mut _,
+            aspects: crate::TexelAspects::COLOR,
         }
     }
 }
@@ -116,6 +117,7 @@ impl Texture {
 #[derive(Clone, Copy, Debug, Hash, PartialEq)]
 pub struct TextureView {
     raw: *mut ProtocolObject<dyn metal::MTLTexture>,
+    aspects: crate::TexelAspects,
 }
 
 unsafe impl Send for TextureView {}
@@ -125,6 +127,7 @@ impl Default for TextureView {
     fn default() -> Self {
         Self {
             raw: ptr::null_mut(),
+            aspects: crate::TexelAspects::COLOR,
         }
     }
 }
@@ -136,9 +139,13 @@ impl TextureView {
 
     /// Create a TextureView from a raw Metal Texture.
     /// Does not keep a reference, need not being destoryed.
-    pub fn from_metal_texture(raw: &Retained<ProtocolObject<dyn metal::MTLTexture>>) -> Self {
+    pub fn from_metal_texture(
+        raw: &Retained<ProtocolObject<dyn metal::MTLTexture>>,
+        aspects: crate::TexelAspects,
+    ) -> Self {
         Self {
             raw: Retained::into_raw(raw.clone()),
+            aspects,
         }
     }
 }
@@ -338,6 +345,7 @@ fn map_texture_format(format: crate::TextureFormat) -> metal::MTLPixelFormat {
         Tf::Depth24UnormStencil8Uint => Mpf::Depth24Unorm_Stencil8,
         Tf::Depth32Float => Mpf::Depth32Float,
         Tf::Depth32FloatStencil8Uint => Mpf::Depth32Float_Stencil8,
+        Tf::Stencil8Uint => Mpf::Stencil8,
         Tf::Bc1Unorm => Mpf::BC1_RGBA,
         Tf::Bc1UnormSrgb => Mpf::BC1_RGBA_sRGB,
         Tf::Bc2Unorm => Mpf::BC2_RGBA,
@@ -548,6 +556,12 @@ impl Context {
     /// This is platform specific API.
     pub fn metal_device(&self) -> Retained<ProtocolObject<dyn metal::MTLDevice>> {
         self.device.lock().unwrap().clone()
+    }
+
+    /// Check if the device supports a specific texture sample count.
+    pub fn supports_texture_sample_count(&self, sample_count: u32) -> bool {
+        self.metal_device()
+            .supportsTextureSampleCount(sample_count as _)
     }
 }
 

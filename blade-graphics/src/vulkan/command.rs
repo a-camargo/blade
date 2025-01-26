@@ -161,43 +161,36 @@ fn make_buffer_image_copy(
 fn map_render_target(rt: &crate::RenderTarget) -> vk::RenderingAttachmentInfo<'static> {
     let mut vk_info = vk::RenderingAttachmentInfo::default()
         .image_view(rt.view.raw)
-        .image_layout(vk::ImageLayout::GENERAL)
-        .load_op(vk::AttachmentLoadOp::LOAD);
+        .image_layout(vk::ImageLayout::GENERAL);
 
-    if let crate::InitOp::Clear(color) = rt.init_op {
-        let cv = if rt.view.aspects.contains(crate::TexelAspects::COLOR) {
-            vk::ClearValue {
-                color: match color {
-                    crate::TextureColor::TransparentBlack => vk::ClearColorValue::default(),
-                    crate::TextureColor::OpaqueBlack => vk::ClearColorValue {
-                        float32: [0.0, 0.0, 0.0, 1.0],
-                    },
-                    crate::TextureColor::White => vk::ClearColorValue { float32: [1.0; 4] },
-                    crate::TextureColor::Custom(values) => vk::ClearColorValue { float32: values }
-                },
-            }
-        } else {
-            vk::ClearValue {
-                depth_stencil: match color {
-                    crate::TextureColor::TransparentBlack => vk::ClearDepthStencilValue::default(),
-                    crate::TextureColor::OpaqueBlack => vk::ClearDepthStencilValue {
-                        depth: 1.0,
-                        stencil: 0,
-                    },
-                    crate::TextureColor::White => vk::ClearDepthStencilValue {
-                        depth: 1.0,
-                        stencil: !0,
-                    },
-                    crate::TextureColor::Custom(_) => vk::ClearDepthStencilValue {
-                        depth: 1.0,
-                        stencil: 0,
-                    },
-                },
-            }
-        };
+    match rt.init_op {
+        crate::InitOp::Load => vk_info = vk_info.load_op(vk::AttachmentLoadOp::LOAD),
+        crate::InitOp::DontCare => vk_info = vk_info.load_op(vk::AttachmentLoadOp::DONT_CARE),
 
-        vk_info.load_op = vk::AttachmentLoadOp::CLEAR;
-        vk_info.clear_value = cv;
+        crate::InitOp::Clear(color) => {
+            let cv = if rt.view.aspects.contains(crate::TexelAspects::COLOR) {
+                vk::ClearValue {
+                    color: match color {
+                        crate::TextureColor::TransparentBlack => {
+                            vk::ClearColorValue { float32: [0.0; 4] }
+                        }
+                        crate::TextureColor::OpaqueBlack => vk::ClearColorValue {
+                            float32: [0.0, 0.0, 0.0, 1.0],
+                        },
+                        crate::TextureColor::White => vk::ClearColorValue { float32: [1.0; 4] },
+                    },
+                }
+            } else {
+                vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: color.depth_clear_value(),
+                        stencil: color.stencil_clear_value(),
+                    },
+                }
+            };
+
+            vk_info = vk_info.load_op(vk::AttachmentLoadOp::CLEAR).clear_value(cv);
+        }
     }
 
     if let crate::FinishOp::ResolveTo(resolve_view) = rt.finish_op {
@@ -890,6 +883,16 @@ impl crate::traits::RenderEncoder for super::RenderCommandEncoder<'_> {
                 .cmd_set_viewport(self.cmd_buf.raw, 0, &[vk_viewport])
         };
     }
+
+    fn set_stencil_reference(&mut self, reference: u32) {
+        unsafe {
+            self.device.core.cmd_set_stencil_reference(
+                self.cmd_buf.raw,
+                vk::StencilFaceFlags::FRONT_AND_BACK,
+                reference,
+            )
+        };
+    }
 }
 
 #[hidden_trait::expose]
@@ -930,11 +933,22 @@ impl crate::traits::PipelineEncoder for super::PipelineEncoder<'_, '_> {
 
 #[hidden_trait::expose]
 impl crate::traits::ComputePipelineEncoder for super::PipelineEncoder<'_, '_> {
+    type BufferPiece = crate::BufferPiece;
+
     fn dispatch(&mut self, groups: [u32; 3]) {
         unsafe {
             self.device
                 .core
                 .cmd_dispatch(self.cmd_buf.raw, groups[0], groups[1], groups[2])
+        };
+    }
+    fn dispatch_indirect(&mut self, indirect_buf: crate::BufferPiece) {
+        unsafe {
+            self.device.core.cmd_dispatch_indirect(
+                self.cmd_buf.raw,
+                indirect_buf.buffer.raw,
+                indirect_buf.offset,
+            )
         };
     }
 }
@@ -956,6 +970,16 @@ impl crate::traits::RenderEncoder for super::PipelineEncoder<'_, '_> {
             self.device
                 .core
                 .cmd_set_viewport(self.cmd_buf.raw, 0, &[vk_viewport])
+        };
+    }
+
+    fn set_stencil_reference(&mut self, reference: u32) {
+        unsafe {
+            self.device.core.cmd_set_stencil_reference(
+                self.cmd_buf.raw,
+                vk::StencilFaceFlags::FRONT_AND_BACK,
+                reference,
+            )
         };
     }
 }

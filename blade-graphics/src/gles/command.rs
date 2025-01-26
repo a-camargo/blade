@@ -239,14 +239,15 @@ impl super::CommandEncoder {
             if let crate::InitOp::Clear(color) = rt.init_op {
                 self.commands.push(super::Command::ClearDepthStencil {
                     depth: if rt.view.aspects.contains(crate::TexelAspects::DEPTH) {
-                        Some(match color {
-                            crate::TextureColor::White => 1.0,
-                            _ => 0.0,
-                        })
+                        Some(color.depth_clear_value())
                     } else {
                         None
                     },
-                    stencil: None, //TODO
+                    stencil: if rt.view.aspects.contains(crate::TexelAspects::STENCIL) {
+                        Some(color.stencil_clear_value())
+                    } else {
+                        None
+                    },
                 });
             }
         }
@@ -307,6 +308,10 @@ impl crate::traits::RenderEncoder for super::PassEncoder<'_, super::RenderPipeli
     fn set_viewport(&mut self, viewport: &crate::Viewport) {
         self.commands
             .push(super::Command::SetViewport(viewport.clone()));
+    }
+
+    fn set_stencil_reference(&mut self, reference: u32) {
+        unimplemented!()
     }
 }
 
@@ -445,8 +450,16 @@ impl crate::traits::PipelineEncoder for super::PipelineEncoder<'_> {
 
 #[hidden_trait::expose]
 impl crate::traits::ComputePipelineEncoder for super::PipelineEncoder<'_> {
+    type BufferPiece = crate::BufferPiece;
+
     fn dispatch(&mut self, groups: [u32; 3]) {
         self.commands.push(super::Command::Dispatch(groups));
+    }
+
+    fn dispatch_indirect(&mut self, indirect_buf: crate::BufferPiece) {
+        self.commands.push(super::Command::DispatchIndirect {
+            indirect_buf: indirect_buf.into(),
+        });
     }
 }
 
@@ -459,6 +472,10 @@ impl crate::traits::RenderEncoder for super::PipelineEncoder<'_> {
     fn set_viewport(&mut self, viewport: &crate::Viewport) {
         self.commands
             .push(super::Command::SetViewport(viewport.clone()));
+    }
+
+    fn set_stencil_reference(&mut self, reference: u32) {
+        unimplemented!()
     }
 }
 

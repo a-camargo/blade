@@ -111,6 +111,7 @@ pub trait AccelerationStructureEncoder {
 pub trait RenderEncoder {
     fn set_scissor_rect(&mut self, rect: &super::ScissorRect);
     fn set_viewport(&mut self, viewport: &super::Viewport);
+    fn set_stencil_reference(&mut self, reference: u32);
 }
 
 pub trait PipelineEncoder {
@@ -118,7 +119,10 @@ pub trait PipelineEncoder {
 }
 
 pub trait ComputePipelineEncoder: PipelineEncoder {
+    type BufferPiece: Send + Sync + Clone + Copy + Debug;
+
     fn dispatch(&mut self, groups: [u32; 3]);
+    fn dispatch_indirect(&mut self, indirect_buf: Self::BufferPiece);
 }
 
 pub trait RenderPipelineEncoder: PipelineEncoder + RenderEncoder {

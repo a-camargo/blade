@@ -77,6 +77,7 @@ impl super::TextureFormat {
             Self::Depth24UnormStencil8Uint => uncompressed(4),
             Self::Depth32Float => uncompressed(4),
             Self::Depth32FloatStencil8Uint => uncompressed(5),
+            Self::Stencil8Uint => uncompressed(1),
             Self::Bc1Unorm => cx_bc(8),
             Self::Bc1UnormSrgb => cx_bc(8),
             Self::Bc2Unorm => cx_bc(16),
@@ -103,7 +104,28 @@ impl super::TextureFormat {
             Self::Depth24UnormStencil8Uint => super::TexelAspects::DEPTH | super::TexelAspects::STENCIL,
             Self::Depth32Float => super::TexelAspects::DEPTH,
             Self::Depth32FloatStencil8Uint => super::TexelAspects::DEPTH | super::TexelAspects::STENCIL,
+            Self::Stencil8Uint => super::TexelAspects::STENCIL,
             _ => super::TexelAspects::COLOR,
+        }
+    }
+}
+
+impl super::TextureColor {
+    pub fn stencil_clear_value(&self) -> u32 {
+        match self {
+            crate::TextureColor::TransparentBlack => 0,
+            crate::TextureColor::OpaqueBlack => !0,
+            crate::TextureColor::White => !0,
+            crate::TextureColor::Custom(_) => todo!(),
+        }
+    }
+
+    pub fn depth_clear_value(&self) -> f32 {
+        match self {
+            crate::TextureColor::TransparentBlack => 0.0,
+            crate::TextureColor::OpaqueBlack => 0.0,
+            crate::TextureColor::White => 1.0,
+            crate::TextureColor::Custom(_) => unimplemented!(),
         }
     }
 }
