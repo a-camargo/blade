@@ -116,7 +116,7 @@ impl super::TextureColor {
             crate::TextureColor::TransparentBlack => 0,
             crate::TextureColor::OpaqueBlack => !0,
             crate::TextureColor::White => !0,
-            crate::TextureColor::Custom(_) => todo!(),
+            crate::TextureColor::Custom(_) => unimplemented!(),
         }
     }
 
