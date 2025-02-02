@@ -178,6 +178,7 @@ fn map_render_target(rt: &crate::RenderTarget) -> vk::RenderingAttachmentInfo<'s
                             float32: [0.0, 0.0, 0.0, 1.0],
                         },
                         crate::TextureColor::White => vk::ClearColorValue { float32: [1.0; 4] },
+                        crate::TextureColor::Custom(value) => vk::ClearColorValue { float32: value }
                     },
                 }
             } else {
