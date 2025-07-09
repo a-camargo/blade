@@ -25,7 +25,11 @@ const REQUIRED_DEVICE_EXTENSIONS: &[&ffi::CStr] = &[
 ];
 
 #[derive(Debug)]
-#[allow(unused)]
+struct RayTracingCapabilities {
+    min_scratch_buffer_alignment: u64,
+}
+
+#[derive(Debug)]
 struct SystemBugs {
     /// https://gitlab.freedesktop.org/mesa/mesa/-/issues/4688
     intel_unable_to_present: bool,
@@ -40,10 +44,11 @@ struct AdapterCapabilities {
     device_information: crate::DeviceInformation,
     queue_family_index: u32,
     layered: bool,
-    ray_tracing: bool,
+    ray_tracing: Option<RayTracingCapabilities>,
     buffer_marker: bool,
     shader_info: bool,
     full_screen_exclusive: bool,
+    external_memory: bool,
     timing: bool,
     bugs: SystemBugs,
 }
@@ -186,6 +191,14 @@ unsafe fn inspect_adapter(
         return None;
     }
 
+    let external_memory = supported_extensions.contains(&vk::KHR_EXTERNAL_MEMORY_NAME);
+    #[cfg(target_os = "windows")]
+    let external_memory =
+        external_memory && supported_extensions.contains(&vk::KHR_EXTERNAL_MEMORY_WIN32_NAME);
+    #[cfg(not(target_os = "windows"))]
+    let external_memory =
+        external_memory && supported_extensions.contains(&vk::KHR_EXTERNAL_MEMORY_FD_NAME);
+
     let timing = if properties.limits.timestamp_compute_and_graphics == vk::FALSE {
         log::info!("No timing because of queue support");
         false
@@ -197,7 +210,7 @@ unsafe fn inspect_adapter(
         || !supported_extensions.contains(&vk::KHR_RAY_QUERY_NAME)
     {
         log::info!("No ray tracing extensions are supported");
-        false
+        None
     } else if descriptor_indexing_properties.max_per_stage_update_after_bind_resources == vk::FALSE
         || descriptor_indexing_features.descriptor_binding_partially_bound == vk::FALSE
         || descriptor_indexing_features.shader_storage_buffer_array_non_uniform_indexing
@@ -209,29 +222,33 @@ unsafe fn inspect_adapter(
             descriptor_indexing_properties,
             descriptor_indexing_features
         );
-        false
+        None
     } else if buffer_device_address_features.buffer_device_address == vk::FALSE {
         log::info!(
             "No ray tracing because of the buffer device address. Features = {:?}",
             buffer_device_address_features
         );
-        false
+        None
     } else if acceleration_structure_properties.max_geometry_count == 0
         || acceleration_structure_features.acceleration_structure == vk::FALSE
     {
         log::info!("No ray tracing because of the acceleration structure. Properties = {:?}. Features = {:?}",
             acceleration_structure_properties, acceleration_structure_features);
-        false
+        None
     } else if ray_query_features.ray_query == vk::FALSE {
         log::info!(
             "No ray tracing because of the ray query. Features = {:?}",
             ray_query_features
         );
-        false
+        None
     } else {
         log::info!("Ray tracing is supported");
         log::debug!("Ray tracing properties: {acceleration_structure_properties:#?}");
-        true
+        Some(RayTracingCapabilities {
+            min_scratch_buffer_alignment: acceleration_structure_properties
+                .min_acceleration_structure_scratch_offset_alignment
+                as u64,
+        })
     };
 
     let buffer_marker = supported_extensions.contains(&vk::AMD_BUFFER_MARKER_NAME);
@@ -261,6 +278,7 @@ unsafe fn inspect_adapter(
         buffer_marker,
         shader_info,
         full_screen_exclusive,
+        external_memory,
         timing,
         bugs,
     })
@@ -415,6 +433,10 @@ impl super::Context {
             .ok_or_else(|| NotSupportedError::NoSupportedDeviceFound)?;
 
         log::debug!("Adapter {:#?}", capabilities);
+        let mut min_buffer_alignment = 1;
+        if let Some(ref rt) = capabilities.ray_tracing {
+            min_buffer_alignment = min_buffer_alignment.max(rt.min_scratch_buffer_alignment);
+        }
 
         let device_core = {
             let family_info = vk::DeviceQueueCreateInfo::default()
@@ -430,7 +452,7 @@ impl super::Context {
                 log::info!("Enabling Vulkan Portability");
                 device_extensions.push(vk::KHR_PORTABILITY_SUBSET_NAME);
             }
-            if capabilities.ray_tracing {
+            if capabilities.ray_tracing.is_some() {
                 if capabilities.api_version < vk::API_VERSION_1_2 {
                     device_extensions.push(vk::EXT_DESCRIPTOR_INDEXING_NAME);
                     device_extensions.push(vk::KHR_BUFFER_DEVICE_ADDRESS_NAME);
@@ -449,6 +471,13 @@ impl super::Context {
             }
             if capabilities.full_screen_exclusive {
                 device_extensions.push(vk::EXT_FULL_SCREEN_EXCLUSIVE_NAME);
+            }
+            if capabilities.external_memory {
+                device_extensions.push(vk::KHR_EXTERNAL_MEMORY_NAME);
+                #[cfg(target_os = "windows")]
+                device_extensions.push(vk::KHR_EXTERNAL_MEMORY_WIN32_NAME);
+                #[cfg(not(target_os = "windows"))]
+                device_extensions.push(vk::KHR_EXTERNAL_MEMORY_FD_NAME);
             }
 
             let str_pointers = device_extensions
@@ -479,7 +508,7 @@ impl super::Context {
             let mut khr_buffer_device_address;
             let mut khr_acceleration_structure;
             let mut khr_ray_query;
-            if capabilities.ray_tracing {
+            if capabilities.ray_tracing.is_some() {
                 ext_descriptor_indexing = vk::PhysicalDeviceDescriptorIndexingFeaturesEXT {
                     shader_storage_buffer_array_non_uniform_indexing: vk::TRUE,
                     shader_sampled_image_array_non_uniform_indexing: vk::TRUE,
@@ -520,7 +549,7 @@ impl super::Context {
             debug_utils: ext::debug_utils::Device::new(&instance.core, &device_core),
             timeline_semaphore: khr::timeline_semaphore::Device::new(&instance.core, &device_core),
             dynamic_rendering: khr::dynamic_rendering::Device::new(&instance.core, &device_core),
-            ray_tracing: if capabilities.ray_tracing {
+            ray_tracing: if capabilities.ray_tracing.is_some() {
                 Some(super::RayTracingDevice {
                     acceleration_structure: khr::acceleration_structure::Device::new(
                         &instance.core,
@@ -551,6 +580,16 @@ impl super::Context {
             } else {
                 None
             },
+            external_memory: if capabilities.external_memory {
+                #[cfg(not(target_os = "windows"))]
+                use khr::external_memory_fd::Device;
+                #[cfg(target_os = "windows")]
+                use khr::external_memory_win32::Device;
+
+                Some(Device::new(&instance.core, &device_core))
+            } else {
+                None
+            },
             core: device_core,
             device_information: capabilities.device_information,
             command_scope: if desc.capture {
@@ -570,7 +609,7 @@ impl super::Context {
                 extra_sync_src_access: vk::AccessFlags::TRANSFER_WRITE,
                 extra_sync_dst_access: vk::AccessFlags::TRANSFER_WRITE
                     | vk::AccessFlags::TRANSFER_READ
-                    | if capabilities.ray_tracing {
+                    | if capabilities.ray_tracing.is_some() {
                         vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR
                     } else {
                         vk::AccessFlags::NONE
@@ -615,7 +654,7 @@ impl super::Context {
                         size: memory_heap.size,
                     })
                     .collect(),
-                buffer_device_address: capabilities.ray_tracing,
+                buffer_device_address: capabilities.ray_tracing.is_some(),
             };
 
             let known_memory_flags = vk::MemoryPropertyFlags::DEVICE_LOCAL
@@ -697,6 +736,7 @@ impl super::Context {
             physical_device,
             naga_flags,
             shader_debug_path,
+            min_buffer_alignment,
             instance,
             entry,
         })
@@ -735,6 +775,7 @@ impl Drop for super::Context {
         }
         unsafe {
             if let Ok(queue) = self.queue.lock() {
+                let _ = self.device.core.queue_wait_idle(queue.raw);
                 self.device
                     .core
                     .destroy_semaphore(queue.timeline_semaphore, None);
