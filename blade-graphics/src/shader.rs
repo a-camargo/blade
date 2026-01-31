@@ -1,3 +1,6 @@
+use once_cell::sync::Lazy;
+use std::borrow::Cow;
+
 impl From<naga::ShaderStage> for super::ShaderVisibility {
     fn from(stage: naga::ShaderStage) -> Self {
         match stage {
@@ -15,7 +18,7 @@ impl super::Context {
         desc: super::ShaderDesc,
     ) -> Result<super::Shader, &'static str> {
         let module = naga::front::wgsl::parse_str(desc.source).map_err(|e| {
-            e.emit_to_stderr_with_path(desc.source, "");
+            eprintln!("{}", e.emit_to_string_with_path(desc.source, ""));
             "compilation failed"
         })?;
 
@@ -27,6 +30,10 @@ impl super::Context {
         caps.set(
             naga::valid::Capabilities::RAY_QUERY | naga::valid::Capabilities::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING,
             !device_caps.ray_query.is_empty(),
+        );
+        caps.set(
+            naga::valid::Capabilities::DUAL_SOURCE_BLENDING,
+            device_caps.dual_source_blending,
         );
         let info = naga::valid::Validator::new(flags, caps)
             .validate(&module)
@@ -48,12 +55,41 @@ impl super::Context {
     }
 }
 
+pub static EMPTY_CONSTANTS: Lazy<super::PipelineConstants> = Lazy::new(Default::default);
+
 impl super::Shader {
     pub fn at<'a>(&'a self, entry_point: &'a str) -> super::ShaderFunction<'a> {
         super::ShaderFunction {
             shader: self,
             entry_point,
+            constants: Lazy::force(&EMPTY_CONSTANTS),
         }
+    }
+
+    pub fn with_constants<'a>(
+        &'a self,
+        entry_point: &'a str,
+        constants: &'a super::PipelineConstants,
+    ) -> super::ShaderFunction<'a> {
+        super::ShaderFunction {
+            shader: self,
+            entry_point,
+            constants,
+        }
+    }
+
+    pub fn resolve_constants<'a>(
+        &'a self,
+        constants: &super::PipelineConstants,
+    ) -> (naga::Module, Cow<'a, naga::valid::ModuleInfo>) {
+        let (module, info) = naga::back::pipeline_constants::process_overrides(
+            &self.module,
+            &self.info,
+            None,
+            constants,
+        )
+        .unwrap();
+        (module.into_owned(), info)
     }
 
     pub fn get_struct_size(&self, struct_name: &str) -> u32 {
@@ -149,7 +185,9 @@ impl super::Shader {
                         }
                         _ => {
                             let type_layout = &layouter[var.ty];
-                            let proto = if var_access.is_empty() {
+                            let proto = if var_access.is_empty()
+                                && proto_binding != crate::ShaderBinding::Buffer
+                            {
                                 crate::ShaderBinding::Plain {
                                     size: type_layout.size,
                                 }

@@ -21,6 +21,10 @@ fn map_blend_factor(factor: crate::BlendFactor) -> metal::MTLBlendFactor {
         Bf::Constant => Mbf::BlendColor,
         Bf::OneMinusConstant => Mbf::OneMinusBlendColor,
         Bf::SrcAlphaSaturated => Mbf::SourceAlphaSaturated,
+        Bf::Src1 => Mbf::Source1Color,
+        Bf::OneMinusSrc1 => Mbf::OneMinusSource1Color,
+        Bf::Src1Alpha => Mbf::Source1Alpha,
+        Bf::OneMinusSrc1Alpha => Mbf::OneMinusSource1Alpha,
     }
 }
 
@@ -199,7 +203,7 @@ impl super::Context {
         let ep_info = sf.shader.info.get_entry_point(ep_index);
         let _ = sf.shader.source;
 
-        let mut module = sf.shader.module.clone();
+        let (mut module, module_info) = sf.shader.resolve_constants(&sf.constants);
         crate::Shader::fill_resource_bindings(
             &mut module,
             &mut pipeline_layout.group_infos,
@@ -287,12 +291,13 @@ impl super::Context {
         };
 
         let pipeline_options = msl::PipelineOptions {
+            entry_point: Some((ep.stage, ep.name.clone())),
             allow_and_force_point_size: flags.contains(ShaderFlags::ALLOW_POINT_SIZE),
             vertex_pulling_transform: false,
             vertex_buffer_mappings: Vec::new(),
         };
         let (source, info) =
-            msl::write_string(&module, &sf.shader.info, &naga_options, &pipeline_options).unwrap();
+            msl::write_string(&module, &module_info, &naga_options, &pipeline_options).unwrap();
 
         log::debug!(
             "Naga generated shader for entry point '{}' and stage {:?}\n{}",

@@ -1,5 +1,5 @@
 use ash::vk;
-use std::{str, time::Duration};
+use std::{ptr, str, time::Duration};
 
 impl super::CrashHandler {
     fn add_marker(&mut self, marker: &str) -> u32 {
@@ -32,7 +32,7 @@ impl super::PipelineContext<'_> {
     fn write<T>(&mut self, index: u32, value: T) {
         let offset = self.template_offsets[index as usize];
         unsafe {
-            std::ptr::write(
+            ptr::write(
                 self.update_data.as_mut_ptr().offset(offset as isize) as *mut T,
                 value,
             )
@@ -45,7 +45,7 @@ impl super::PipelineContext<'_> {
         let base_ptr =
             unsafe { self.update_data.as_mut_ptr().offset(base_offset as isize) as *mut I::Item };
         for (i, value) in iter.enumerate() {
-            unsafe { std::ptr::write(base_ptr.add(i), value) };
+            unsafe { ptr::write(base_ptr.add(i), value) };
         }
     }
 }
@@ -69,13 +69,18 @@ impl crate::ShaderBindable for super::TextureView {
 }
 impl<'a, const N: crate::ResourceIndex> crate::ShaderBindable for &'a crate::TextureArray<N> {
     fn bind_to(&self, ctx: &mut super::PipelineContext, index: u32) {
+        assert!(self.data.len() <= N as usize);
         ctx.write_array(
             index,
-            self.data.iter().map(|view| vk::DescriptorImageInfo {
-                sampler: vk::Sampler::null(),
-                image_view: view.raw,
-                image_layout: vk::ImageLayout::GENERAL,
-            }),
+            self.data
+                .iter()
+                .map(|view| vk::DescriptorImageInfo {
+                    sampler: vk::Sampler::null(),
+                    image_view: view.raw,
+                    image_layout: vk::ImageLayout::GENERAL,
+                })
+                .cycle()
+                .take(N as usize),
         );
     }
 }
@@ -105,13 +110,18 @@ impl crate::ShaderBindable for crate::BufferPiece {
 }
 impl<'a, const N: crate::ResourceIndex> crate::ShaderBindable for &'a crate::BufferArray<N> {
     fn bind_to(&self, ctx: &mut super::PipelineContext, index: u32) {
+        assert!(self.data.len() <= N as usize);
         ctx.write_array(
             index,
-            self.data.iter().map(|piece| vk::DescriptorBufferInfo {
-                buffer: piece.buffer.raw,
-                offset: piece.offset,
-                range: vk::WHOLE_SIZE,
-            }),
+            self.data
+                .iter()
+                .map(|piece| vk::DescriptorBufferInfo {
+                    buffer: piece.buffer.raw,
+                    offset: piece.offset,
+                    range: vk::WHOLE_SIZE,
+                })
+                .cycle()
+                .take(N as usize),
         );
     }
 }
@@ -330,7 +340,7 @@ impl super::CommandEncoder {
         }
     }
 
-    pub fn transfer(&mut self, label: &str) -> super::TransferCommandEncoder {
+    pub fn transfer(&mut self, label: &str) -> super::TransferCommandEncoder<'_> {
         self.begin_pass(label);
         super::TransferCommandEncoder {
             raw: self.buffers[0].raw,
@@ -341,7 +351,7 @@ impl super::CommandEncoder {
     pub fn acceleration_structure(
         &mut self,
         label: &str,
-    ) -> super::AccelerationStructureCommandEncoder {
+    ) -> super::AccelerationStructureCommandEncoder<'_> {
         self.begin_pass(label);
         super::AccelerationStructureCommandEncoder {
             raw: self.buffers[0].raw,
@@ -349,7 +359,7 @@ impl super::CommandEncoder {
         }
     }
 
-    pub fn compute(&mut self, label: &str) -> super::ComputeCommandEncoder {
+    pub fn compute(&mut self, label: &str) -> super::ComputeCommandEncoder<'_> {
         self.begin_pass(label);
         super::ComputeCommandEncoder {
             cmd_buf: self.buffers.first_mut().unwrap(),
@@ -362,7 +372,7 @@ impl super::CommandEncoder {
         &mut self,
         label: &str,
         targets: crate::RenderTargetSet,
-    ) -> super::RenderCommandEncoder {
+    ) -> super::RenderCommandEncoder<'_> {
         self.begin_pass(label);
 
         let mut target_size = [0u16; 2];
@@ -549,9 +559,10 @@ impl crate::traits::CommandEncoder for super::CommandEncoder {
         assert_eq!(self.present, None);
         let wa = &self.device.workarounds;
         self.present = Some(super::Presentation {
-            acquire_semaphore: frame.internal.acquire_semaphore,
             swapchain: frame.swapchain.raw,
             image_index,
+            acquire_semaphore: frame.internal.acquire_semaphore,
+            present_semaphore: frame.internal.present_semaphore,
         });
 
         let barrier = vk::ImageMemoryBarrier {
@@ -702,18 +713,19 @@ impl crate::traits::AccelerationStructureEncoder
         meshes: &[crate::AccelerationStructureMesh],
         scratch_data: crate::BufferPiece,
     ) {
+        let rt = self.device.ray_tracing.as_ref().unwrap();
         let mut blas_input = self.device.map_acceleration_structure_meshes(meshes);
         blas_input.build_info.dst_acceleration_structure = acceleration_structure.raw;
         let scratch_address = self.device.get_device_address(&scratch_data);
-        assert!(
-            scratch_address & 0xFF == 0,
+        assert_eq!(
+            scratch_address & rt.scratch_buffer_alignment,
+            0,
             "BLAS scratch address {scratch_address} is not aligned"
         );
         blas_input.build_info.scratch_data = vk::DeviceOrHostAddressKHR {
             device_address: scratch_address,
         };
 
-        let rt = self.device.ray_tracing.as_ref().unwrap();
         unsafe {
             rt.acceleration_structure.cmd_build_acceleration_structures(
                 self.raw,

@@ -13,27 +13,28 @@ struct CompiledShader<'a> {
 }
 
 impl super::Context {
-    fn make_spv_options(&self, data_layouts: &[&crate::ShaderDataLayout]) -> spv::Options {
+    fn make_spv_options(&self, data_layouts: &[&crate::ShaderDataLayout]) -> spv::Options<'_> {
         // collect all the array bindings into overrides
         let mut binding_map = spv::BindingMap::default();
         for (group_index, layout) in data_layouts.iter().enumerate() {
             for (binding_index, &(_, binding)) in layout.bindings.iter().enumerate() {
-                match binding {
+                let binding_array_size = match binding {
                     crate::ShaderBinding::TextureArray { count }
-                    | crate::ShaderBinding::BufferArray { count } => {
-                        let rb = naga::ResourceBinding {
-                            group: group_index as u32,
-                            binding: binding_index as u32,
-                        };
-                        binding_map.insert(
-                            rb,
-                            spv::BindingInfo {
-                                binding_array_size: Some(count),
-                            },
-                        );
-                    }
-                    _ => {}
-                }
+                    | crate::ShaderBinding::BufferArray { count } => Some(count),
+                    _ => None,
+                };
+                let rb = naga::ResourceBinding {
+                    group: group_index as u32,
+                    binding: binding_index as u32,
+                };
+                binding_map.insert(
+                    rb,
+                    spv::BindingInfo {
+                        descriptor_set: group_index as u32,
+                        binding: binding_index as u32,
+                        binding_array_size,
+                    },
+                );
             }
         }
 
@@ -44,11 +45,13 @@ impl super::Context {
                 None => (1, 3),
             },
             flags: self.naga_flags,
+            fake_missing_bindings: false,
             binding_map,
             capabilities: None,
             bounds_check_policies: naga::proc::BoundsCheckPolicies::default(),
             zero_initialize_workgroup_memory: spv::ZeroInitializeWorkgroupMemoryMode::None,
             force_loop_bounding: false,
+            use_storage_input_output_16: false,
             debug_info: None,
         }
     }
@@ -60,12 +63,12 @@ impl super::Context {
         group_layouts: &[&crate::ShaderDataLayout],
         group_infos: &mut [crate::ShaderDataInfo],
         vertex_fetch_states: &[crate::VertexFetchState],
-    ) -> CompiledShader {
+    ) -> CompiledShader<'_> {
         let ep_index = sf.entry_point_index();
         let ep = &sf.shader.module.entry_points[ep_index];
         let ep_info = sf.shader.info.get_entry_point(ep_index);
 
-        let mut module = sf.shader.module.clone();
+        let (mut module, module_info) = sf.shader.resolve_constants(&sf.constants);
         crate::Shader::fill_resource_bindings(
             &mut module,
             group_infos,
@@ -81,6 +84,7 @@ impl super::Context {
             entry_point: sf.entry_point.to_string(),
         };
         let file_path;
+        let file_name_str;
         let mut naga_options_debug;
         let naga_options = if let Some(ref temp_dir) = self.shader_debug_path {
             use std::{
@@ -90,13 +94,20 @@ impl super::Context {
             let mut hasher = DefaultHasher::new();
             sf.shader.source.hash(&mut hasher);
             file_path = temp_dir.join(format!("{}-{:x}.wgsl", sf.entry_point, hasher.finish()));
-            log::debug!("Dumping processed shader code to: {}", file_path.display());
+            log::info!("Dumping processed shader code to: {}", file_path.display());
             let _ = fs::write(&file_path, &sf.shader.source);
 
+            // Dump Naga Module IR alongside the WGSL for easier debugging.
+            let naga_ir_path =
+                temp_dir.join(format!("{}-{:x}.txt", sf.entry_point, hasher.finish()));
+            log::info!("Dumping Naga module IR to: {}", naga_ir_path.display());
+            let _ = fs::write(&naga_ir_path, format!("{:#?}\n", &module));
+
             naga_options_debug = naga_options_base.clone();
+            file_name_str = file_path.to_string_lossy().into_owned();
             naga_options_debug.debug_info = Some(naga::back::spv::DebugInfo {
                 source_code: &sf.shader.source,
-                file_name: &file_path,
+                file_name: &file_name_str,
                 //TODO: switch to WGSL once NSight Graphics recognizes it
                 language: naga::back::spv::SourceLanguage::GLSL,
             });
@@ -105,13 +116,8 @@ impl super::Context {
             naga_options_base
         };
 
-        let spv = spv::write_vec(
-            &module,
-            &sf.shader.info,
-            naga_options,
-            Some(&pipeline_options),
-        )
-        .unwrap();
+        let spv =
+            spv::write_vec(&module, &module_info, naga_options, Some(&pipeline_options)).unwrap();
 
         if let Some(dump_prefix) = DUMP_PREFIX {
             let mut file_name = String::new();
@@ -573,6 +579,11 @@ impl crate::traits::ShaderDevice for super::Context {
             let mut vk_attachment = vk::PipelineColorBlendAttachmentState::default()
                 .color_write_mask(vk::ColorComponentFlags::from_raw(ct.write_mask.bits()));
             if let Some(ref blend) = ct.blend {
+                assert!(
+                    !blend.uses_dual_source() || self.dual_source_blending,
+                    "Dual-source blending is not supported by this Vulkan device"
+                );
+
                 let (color_op, color_src, color_dst) = map_blend_component(&blend.color);
                 let (alpha_op, alpha_src, alpha_dst) = map_blend_component(&blend.alpha);
                 vk_attachment = vk_attachment
@@ -739,6 +750,10 @@ fn map_blend_factor(factor: crate::BlendFactor) -> vk::BlendFactor {
         Bf::SrcAlphaSaturated => vk::BlendFactor::SRC_ALPHA_SATURATE,
         Bf::Constant => vk::BlendFactor::CONSTANT_COLOR,
         Bf::OneMinusConstant => vk::BlendFactor::ONE_MINUS_CONSTANT_COLOR,
+        Bf::Src1 => vk::BlendFactor::SRC1_COLOR,
+        Bf::OneMinusSrc1 => vk::BlendFactor::ONE_MINUS_SRC1_COLOR,
+        Bf::Src1Alpha => vk::BlendFactor::SRC1_ALPHA,
+        Bf::OneMinusSrc1Alpha => vk::BlendFactor::ONE_MINUS_SRC1_ALPHA,
     }
 }
 

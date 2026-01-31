@@ -50,6 +50,7 @@ struct AdapterCapabilities {
     full_screen_exclusive: bool,
     external_memory: bool,
     timing: bool,
+    dual_source_blending: bool,
     bugs: SystemBugs,
 }
 
@@ -161,6 +162,8 @@ unsafe fn inspect_adapter(
         .get_physical_device_properties2
         .get_physical_device_features2(phd, &mut features2_khr);
 
+    let dual_source_blending = features2_khr.features.dual_src_blend != 0;
+
     if inline_uniform_block_properties.max_inline_uniform_block_size
         < crate::limits::PLAIN_DATA_SIZE
         || inline_uniform_block_properties.max_descriptor_set_inline_uniform_blocks == 0
@@ -192,12 +195,12 @@ unsafe fn inspect_adapter(
     }
 
     let external_memory = supported_extensions.contains(&vk::KHR_EXTERNAL_MEMORY_NAME);
-    #[cfg(target_os = "windows")]
-    let external_memory =
-        external_memory && supported_extensions.contains(&vk::KHR_EXTERNAL_MEMORY_WIN32_NAME);
-    #[cfg(not(target_os = "windows"))]
-    let external_memory =
-        external_memory && supported_extensions.contains(&vk::KHR_EXTERNAL_MEMORY_FD_NAME);
+    let external_memory = external_memory
+        && supported_extensions.contains(if cfg!(target_os = "windows") {
+            &vk::KHR_EXTERNAL_MEMORY_WIN32_NAME
+        } else {
+            &vk::KHR_EXTERNAL_MEMORY_FD_NAME
+        });
 
     let timing = if properties.limits.timestamp_compute_and_graphics == vk::FALSE {
         log::info!("No timing because of queue support");
@@ -280,6 +283,7 @@ unsafe fn inspect_adapter(
         full_screen_exclusive,
         external_memory,
         timing,
+        dual_source_blending,
         bugs,
     })
 }
@@ -350,16 +354,17 @@ impl super::Context {
             let mut instance_extensions = vec![
                 vk::EXT_DEBUG_UTILS_NAME,
                 vk::KHR_GET_PHYSICAL_DEVICE_PROPERTIES2_NAME,
-                vk::KHR_GET_SURFACE_CAPABILITIES2_NAME,
             ];
             if desc.presentation {
                 instance_extensions.push(vk::KHR_SURFACE_NAME);
+                instance_extensions.push(vk::KHR_GET_SURFACE_CAPABILITIES2_NAME);
                 let candidates = [
                     vk::KHR_WAYLAND_SURFACE_NAME,
                     vk::KHR_XCB_SURFACE_NAME,
                     vk::KHR_XLIB_SURFACE_NAME,
                     vk::KHR_WIN32_SURFACE_NAME,
                     vk::KHR_ANDROID_SURFACE_NAME,
+                    vk::EXT_SWAPCHAIN_COLORSPACE_NAME,
                 ];
                 for candidate in candidates.iter() {
                     if supported_instance_extensions.contains(candidate) {
@@ -379,10 +384,6 @@ impl super::Context {
                 log::info!("Enabling Vulkan Portability");
                 instance_extensions.push(vk::KHR_PORTABILITY_ENUMERATION_NAME);
                 create_flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
-            }
-            if supported_instance_extensions.contains(&vk::EXT_SWAPCHAIN_COLORSPACE_NAME) {
-                log::info!("Enabling color space support");
-                instance_extensions.push(vk::EXT_SWAPCHAIN_COLORSPACE_NAME);
             }
 
             let app_info = vk::ApplicationInfo::default()
@@ -409,10 +410,14 @@ impl super::Context {
                 _debug_utils: ext::debug_utils::Instance::new(&entry, &core_instance),
                 get_physical_device_properties2:
                     khr::get_physical_device_properties2::Instance::new(&entry, &core_instance),
-                get_surface_capabilities2: khr::get_surface_capabilities2::Instance::new(
-                    &entry,
-                    &core_instance,
-                ),
+                get_surface_capabilities2: if desc.presentation {
+                    Some(khr::get_surface_capabilities2::Instance::new(
+                        &entry,
+                        &core_instance,
+                    ))
+                } else {
+                    None
+                },
                 surface: if desc.presentation {
                     Some(khr::surface::Instance::new(&entry, &core_instance))
                 } else {
@@ -474,10 +479,11 @@ impl super::Context {
             }
             if capabilities.external_memory {
                 device_extensions.push(vk::KHR_EXTERNAL_MEMORY_NAME);
-                #[cfg(target_os = "windows")]
-                device_extensions.push(vk::KHR_EXTERNAL_MEMORY_WIN32_NAME);
-                #[cfg(not(target_os = "windows"))]
-                device_extensions.push(vk::KHR_EXTERNAL_MEMORY_FD_NAME);
+                device_extensions.push(if cfg!(target_os = "windows") {
+                    vk::KHR_EXTERNAL_MEMORY_WIN32_NAME
+                } else {
+                    vk::KHR_EXTERNAL_MEMORY_FD_NAME
+                });
             }
 
             let str_pointers = device_extensions
@@ -549,12 +555,13 @@ impl super::Context {
             debug_utils: ext::debug_utils::Device::new(&instance.core, &device_core),
             timeline_semaphore: khr::timeline_semaphore::Device::new(&instance.core, &device_core),
             dynamic_rendering: khr::dynamic_rendering::Device::new(&instance.core, &device_core),
-            ray_tracing: if capabilities.ray_tracing.is_some() {
+            ray_tracing: if let Some(ref caps) = capabilities.ray_tracing {
                 Some(super::RayTracingDevice {
                     acceleration_structure: khr::acceleration_structure::Device::new(
                         &instance.core,
                         &device_core,
                     ),
+                    scratch_buffer_alignment: caps.min_scratch_buffer_alignment,
                 })
             } else {
                 None
@@ -572,7 +579,7 @@ impl super::Context {
             } else {
                 None
             },
-            full_screen_exclusive: if capabilities.full_screen_exclusive {
+            full_screen_exclusive: if desc.presentation && capabilities.full_screen_exclusive {
                 Some(ext::full_screen_exclusive::Device::new(
                     &instance.core,
                     &device_core,
@@ -706,11 +713,6 @@ impl super::Context {
             .core
             .create_semaphore(&timeline_semaphore_create_info, None)
             .unwrap();
-        let present_semaphore_create_info = vk::SemaphoreCreateInfo::default();
-        let present_semaphore = device
-            .core
-            .create_semaphore(&present_semaphore_create_info, None)
-            .unwrap();
 
         let mut naga_flags = spv::WriterFlags::FORCE_POINT_SIZE;
         let shader_debug_path = if desc.validation || desc.capture {
@@ -730,13 +732,21 @@ impl super::Context {
             queue: Mutex::new(super::Queue {
                 raw: queue,
                 timeline_semaphore,
-                present_semaphore,
                 last_progress,
             }),
             physical_device,
             naga_flags,
             shader_debug_path,
             min_buffer_alignment,
+            sample_count_flags: capabilities
+                .properties
+                .limits
+                .framebuffer_color_sample_counts
+                & capabilities
+                    .properties
+                    .limits
+                    .framebuffer_depth_sample_counts,
+            dual_source_blending: capabilities.dual_source_blending,
             instance,
             entry,
         })
@@ -760,6 +770,8 @@ impl super::Context {
                 Some(_) => crate::ShaderVisibility::all(),
                 None => crate::ShaderVisibility::empty(),
             },
+            sample_count_mask: self.sample_count_flags.as_raw(),
+            dual_source_blending: self.dual_source_blending,
         }
     }
 
@@ -779,9 +791,6 @@ impl Drop for super::Context {
                 self.device
                     .core
                     .destroy_semaphore(queue.timeline_semaphore, None);
-                self.device
-                    .core
-                    .destroy_semaphore(queue.present_semaphore, None);
             }
             self.device.core.destroy_device(None);
             self.instance.core.destroy_instance(None);

@@ -23,7 +23,7 @@
     clippy::pattern_type_mismatch,
 )]
 
-pub use naga::{StorageAccess, VectorSize};
+pub use naga::{back::PipelineConstants, StorageAccess, VectorSize};
 pub type Transform = mint::RowMatrix3x4<f32>;
 
 pub const IDENTITY_TRANSFORM: Transform = mint::RowMatrix3x4 {
@@ -124,6 +124,10 @@ impl From<PlatformError> for NotSupportedError {
 pub struct Capabilities {
     /// Which shader stages support ray queries
     pub ray_query: ShaderVisibility,
+    /// Bit mask of supported MSAA sample counts.
+    pub sample_count_mask: u32,
+    /// Support for dual-source blending.
+    pub dual_source_blending: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -625,6 +629,7 @@ pub struct Shader {
 pub struct ShaderFunction<'a> {
     pub shader: &'a Shader,
     pub entry_point: &'a str,
+    pub constants: &'a PipelineConstants,
 }
 
 impl ShaderFunction<'_> {
@@ -917,6 +922,26 @@ pub enum BlendFactor {
     Constant,
     /// 1.0 - Constant
     OneMinusConstant,
+    /// S1.component
+    Src1,
+    /// 1.0 - S1.component
+    OneMinusSrc1,
+    /// S1.alpha
+    Src1Alpha,
+    /// 1.0 - S1.alpha
+    OneMinusSrc1Alpha,
+}
+
+impl BlendFactor {
+    pub const fn uses_dual_source(&self) -> bool {
+        matches!(
+            self,
+            BlendFactor::Src1
+                | BlendFactor::OneMinusSrc1
+                | BlendFactor::Src1Alpha
+                | BlendFactor::OneMinusSrc1Alpha
+        )
+    }
 }
 
 /// Alpha blend operation.
@@ -968,6 +993,10 @@ impl BlendComponent {
         dst_factor: BlendFactor::One,
         operation: BlendOperation::Add,
     };
+
+    pub const fn uses_dual_source(&self) -> bool {
+        self.src_factor.uses_dual_source() || self.dst_factor.uses_dual_source()
+    }
 }
 
 impl Default for BlendComponent {
@@ -1014,6 +1043,10 @@ impl BlendState {
         color: BlendComponent::ADDITIVE,
         alpha: BlendComponent::ADDITIVE,
     };
+
+    pub const fn uses_dual_source(&self) -> bool {
+        self.color.uses_dual_source() || self.alpha.uses_dual_source()
+    }
 }
 
 bitflags::bitflags! {

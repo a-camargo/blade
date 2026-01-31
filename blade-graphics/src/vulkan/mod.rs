@@ -23,13 +23,14 @@ struct Instance {
     core: ash::Instance,
     _debug_utils: ash::ext::debug_utils::Instance,
     get_physical_device_properties2: khr::get_physical_device_properties2::Instance,
-    get_surface_capabilities2: khr::get_surface_capabilities2::Instance,
+    get_surface_capabilities2: Option<khr::get_surface_capabilities2::Instance>,
     surface: Option<khr::surface::Instance>,
 }
 
 #[derive(Clone)]
 struct RayTracingDevice {
     acceleration_structure: khr::acceleration_structure::Device,
+    scratch_buffer_alignment: u64,
 }
 
 #[derive(Clone, Default)]
@@ -76,13 +77,13 @@ struct MemoryManager {
 struct Queue {
     raw: vk::Queue,
     timeline_semaphore: vk::Semaphore,
-    present_semaphore: vk::Semaphore,
     last_progress: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct InternalFrame {
     acquire_semaphore: vk::Semaphore,
+    present_semaphore: vk::Semaphore,
     image: vk::Image,
     view: vk::ImageView,
 }
@@ -109,6 +110,7 @@ struct Presentation {
     swapchain: vk::SwapchainKHR,
     image_index: u32,
     acquire_semaphore: vk::Semaphore,
+    present_semaphore: vk::Semaphore,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -155,33 +157,10 @@ pub struct Context {
     naga_flags: naga::back::spv::WriterFlags,
     shader_debug_path: Option<PathBuf>,
     min_buffer_alignment: u64,
+    sample_count_flags: vk::SampleCountFlags,
+    dual_source_blending: bool,
     instance: Instance,
     entry: ash::Entry,
-}
-
-impl Context {
-    /// Check if the device supports a specific texture sample count.
-    pub fn supports_texture_sample_count(&self, sample_count: u32) -> bool {
-        let properties = unsafe {
-            self.instance
-                .core
-                .get_physical_device_properties(self.physical_device)
-        };
-
-        let max_count = properties.limits.framebuffer_color_sample_counts
-            & properties.limits.framebuffer_depth_sample_counts;
-
-        match sample_count {
-            1 => true,
-            2 => max_count.contains(vk::SampleCountFlags::TYPE_2),
-            4 => max_count.contains(vk::SampleCountFlags::TYPE_4),
-            8 => max_count.contains(vk::SampleCountFlags::TYPE_8),
-            16 => max_count.contains(vk::SampleCountFlags::TYPE_16),
-            32 => max_count.contains(vk::SampleCountFlags::TYPE_32),
-            64 => max_count.contains(vk::SampleCountFlags::TYPE_64),
-            _ => false,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq)]
@@ -509,11 +488,12 @@ impl crate::traits::CommandDevice for Context {
         let wait_values_all = [0];
         let mut wait_semaphores_all = [vk::Semaphore::null()];
         let wait_stages = [vk::PipelineStageFlags::ALL_COMMANDS];
-        let signal_semaphores_all = [queue.timeline_semaphore, queue.present_semaphore];
+        let mut signal_semaphores_all = [queue.timeline_semaphore, vk::Semaphore::null()];
         let signal_values_all = [progress, 0];
         let (num_wait_semaphores, num_signal_sepahores) = match encoder.present {
             Some(ref presentation) => {
                 wait_semaphores_all[0] = presentation.acquire_semaphore;
+                signal_semaphores_all[1] = presentation.present_semaphore;
                 (1, 2)
             }
             None => (0, 1),
@@ -538,7 +518,7 @@ impl crate::traits::CommandDevice for Context {
             let khr_swapchain = self.device.swapchain.as_ref().unwrap();
             let swapchains = [presentation.swapchain];
             let image_indices = [presentation.image_index];
-            let wait_semaphores = [queue.present_semaphore];
+            let wait_semaphores = [presentation.present_semaphore];
             let present_info = vk::PresentInfoKHR::default()
                 .swapchains(&swapchains)
                 .image_indices(&image_indices)
@@ -716,7 +696,7 @@ impl Device {
     fn map_acceleration_structure_meshes(
         &self,
         meshes: &[crate::AccelerationStructureMesh],
-    ) -> BottomLevelAccelerationStructureInput {
+    ) -> BottomLevelAccelerationStructureInput<'_> {
         let mut total_primitive_count = 0;
         let mut max_primitive_counts = Vec::with_capacity(meshes.len());
         let mut build_range_infos = Vec::with_capacity(meshes.len());
